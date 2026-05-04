@@ -60,6 +60,55 @@ function json(res, status, body) {
   res.end(data);
 }
 
+let activeChatRequests = 0;
+const chatWaiters = [];
+
+async function acquireChatSlot() {
+  const max = config.maxConcurrentChats;
+  if (!Number.isFinite(max) || max <= 0) return () => {};
+  if (activeChatRequests < max) {
+    activeChatRequests++;
+    return releaseChatSlot;
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, done: false, timer: null };
+    waiter.timer = setTimeout(() => {
+      waiter.done = true;
+      reject(new Error('concurrency_queue_timeout'));
+    }, Math.max(1, config.concurrencyQueueMs || 30000));
+    chatWaiters.push(waiter);
+  });
+}
+
+function releaseChatSlot() {
+  const max = config.maxConcurrentChats;
+  if (Number.isFinite(max) && max > 0 && activeChatRequests > 0) activeChatRequests--;
+  while (chatWaiters.length > 0) {
+    const waiter = chatWaiters.shift();
+    if (waiter.done) continue;
+    waiter.done = true;
+    clearTimeout(waiter.timer);
+    activeChatRequests++;
+    waiter.resolve(releaseChatSlot);
+    break;
+  }
+}
+
+async function withChatConcurrency(res, fn) {
+  let release;
+  try {
+    release = await acquireChatSlot();
+  } catch {
+    json(res, 429, { error: { message: 'Too many concurrent chat requests', type: 'rate_limit_exceeded' } });
+    return;
+  }
+  try {
+    await fn();
+  } finally {
+    release?.();
+  }
+}
+
 async function route(req, res) {
   const { method } = req;
   const path = req.url.split('?')[0];
@@ -204,23 +253,25 @@ async function route(req, res) {
       return json(res, 400, { error: { message: 'messages must contain at least 1 item', type: 'invalid_request' } });
     }
 
-    body._source = 'POST /v1/chat/completions';
-    const result = await handleChatCompletions(body, { callerKey });
-    if (result.stream) {
-      // Streaming tuning: keep the socket hot and unblock the first byte.
-      //   setNoDelay — disable Nagle so small SSE deltas aren't coalesced (40ms win)
-      //   setKeepAlive + setTimeout(0) — survive long thinking pauses w/o RST
-      //   flushHeaders — push HTTP response line + headers to the client NOW,
-      //     so SSE clients (esp. CC) exit their "connecting" state immediately
-      req.socket?.setKeepAlive(true);
-      req.setTimeout(0);
-      res.socket?.setNoDelay(true);
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
-      res.flushHeaders?.();
-      await result.handler(res);
-    } else {
-      json(res, result.status, result.body);
-    }
+    await withChatConcurrency(res, async () => {
+      body._source = 'POST /v1/chat/completions';
+      const result = await handleChatCompletions(body, { callerKey });
+      if (result.stream) {
+        // Streaming tuning: keep the socket hot and unblock the first byte.
+        //   setNoDelay — disable Nagle so small SSE deltas aren't coalesced (40ms win)
+        //   setKeepAlive + setTimeout(0) — survive long thinking pauses w/o RST
+        //   flushHeaders — push HTTP response line + headers to the client NOW,
+        //     so SSE clients (esp. CC) exit their "connecting" state immediately
+        req.socket?.setKeepAlive(true);
+        req.setTimeout(0);
+        res.socket?.setNoDelay(true);
+        res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
+        res.flushHeaders?.();
+        await result.handler(res);
+      } else {
+        json(res, result.status, result.body);
+      }
+    });
     return;
   }
 
@@ -235,17 +286,19 @@ async function route(req, res) {
     try { body = JSON.parse(await readBody(req)); } catch {
       return json(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request' } });
     }
-    const result = await handleResponses(body, { context: { callerKey } });
-    if (result.stream) {
-      req.socket?.setKeepAlive(true);
-      req.setTimeout(0);
-      res.socket?.setNoDelay(true);
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
-      res.flushHeaders?.();
-      await result.handler(res);
-    } else {
-      json(res, result.status, result.body);
-    }
+    await withChatConcurrency(res, async () => {
+      const result = await handleResponses(body, { context: { callerKey } });
+      if (result.stream) {
+        req.socket?.setKeepAlive(true);
+        req.setTimeout(0);
+        res.socket?.setNoDelay(true);
+        res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
+        res.flushHeaders?.();
+        await result.handler(res);
+      } else {
+        json(res, result.status, result.body);
+      }
+    });
     return;
   }
 
@@ -262,18 +315,20 @@ async function route(req, res) {
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages must be a non-empty array' } });
     }
-    const result = await handleMessages(body, { callerKey });
-    if (result.stream) {
-      // Same streaming tuning as /v1/chat/completions — see comment above.
-      req.socket?.setKeepAlive(true);
-      req.setTimeout(0);
-      res.socket?.setNoDelay(true);
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
-      res.flushHeaders?.();
-      await result.handler(res);
-    } else {
-      json(res, result.status, result.body);
-    }
+    await withChatConcurrency(res, async () => {
+      const result = await handleMessages(body, { callerKey });
+      if (result.stream) {
+        // Same streaming tuning as /v1/chat/completions — see comment above.
+        req.socket?.setKeepAlive(true);
+        req.setTimeout(0);
+        res.socket?.setNoDelay(true);
+        res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
+        res.flushHeaders?.();
+        await result.handler(res);
+      } else {
+        json(res, result.status, result.body);
+      }
+    });
     return;
   }
 
@@ -315,6 +370,7 @@ export function startServer() {
   });
 
   server.getActiveRequests = () => activeRequests.size;
+  server.getActiveChatRequests = () => activeChatRequests;
 
   server.listen({ port: config.port, host: '0.0.0.0' }, () => {
     log.info(`Server on http://0.0.0.0:${config.port}`);

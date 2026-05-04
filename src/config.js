@@ -60,6 +60,8 @@ export const config = {
   defaultModel: process.env.DEFAULT_MODEL || 'claude-4.5-sonnet-thinking',
   maxTokens: parseInt(process.env.MAX_TOKENS || '8192', 10),
   logLevel: process.env.LOG_LEVEL || 'info',
+  maxConcurrentChats: parseInt(process.env.MAX_CONCURRENT_CHATS || '0', 10),
+  concurrencyQueueMs: parseInt(process.env.CONCURRENCY_QUEUE_MS || '30000', 10),
 
   // Language server — auto-detect default binary name by platform/arch so
   // Windsurf's per-OS LS binaries just work out of the box. User can always
