@@ -1,10 +1,12 @@
 # Zero-dependency Node 20 runtime. The project has no `npm install` step —
 # everything lives in `node:*` builtins — so this image is effectively
-# Node + source, nothing else.
-FROM node:20-alpine
+# Node + source, nothing else. Use Debian/glibc because the mounted Windsurf
+# Language Server binary is built for glibc and does not run on Alpine/musl.
+FROM node:20-bookworm-slim
 
 # Non-root user for the app
-RUN addgroup -S app && adduser -S app -G app
+RUN groupadd --system --gid 101 app \
+    && useradd --system --uid 101 --gid app --home-dir /app app
 
 WORKDIR /app
 
