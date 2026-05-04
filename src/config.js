@@ -62,6 +62,7 @@ export const config = {
   logLevel: process.env.LOG_LEVEL || 'info',
   maxConcurrentChats: parseInt(process.env.MAX_CONCURRENT_CHATS || '0', 10),
   concurrencyQueueMs: parseInt(process.env.CONCURRENCY_QUEUE_MS || '30000', 10),
+  accountMaxConcurrentChats: parseInt(process.env.ACCOUNT_MAX_CONCURRENT_CHATS || '1', 10),
 
   // Language server — auto-detect default binary name by platform/arch so
   // Windsurf's per-OS LS binaries just work out of the box. User can always

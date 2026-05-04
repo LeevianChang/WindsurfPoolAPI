@@ -5,7 +5,7 @@
 
 import { randomUUID } from 'crypto';
 import { WindsurfClient } from '../client.js';
-import { getApiKey, acquireAccountByKey, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited } from '../auth.js';
+import { waitForApiKey, acquireAccountByKey, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited } from '../auth.js';
 import { resolveModelWithOptions, getModelInfo } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
@@ -25,7 +25,6 @@ import {
 import { sanitizeText, PathSanitizeStream } from '../sanitize.js';
 
 const HEARTBEAT_MS = 5_000;
-const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
 
 // ── Language-following reinforcement ──────────────────────────
@@ -141,19 +140,8 @@ function buildUsageBody(serverUsage, messages, completionText, thinkingText = ''
   };
 }
 
-// Wait until getApiKey returns a non-null account, or until maxWaitMs expires.
-// Used when every account has momentarily exhausted its RPM budget so the
-// client is queued instead of getting a 503.
 async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, modelKey = null) {
-  const deadline = Date.now() + maxWaitMs;
-  let acct = getApiKey(tried, modelKey);
-  while (!acct) {
-    if (signal?.aborted) return null;
-    if (Date.now() >= deadline) return null;
-    await new Promise(r => setTimeout(r, QUEUE_RETRY_MS));
-    acct = getApiKey(tried, modelKey);
-  }
-  return acct;
+  return waitForApiKey(tried, modelKey, signal, maxWaitMs);
 }
 
 export async function handleChatCompletions(body, deps = {}) {
@@ -306,58 +294,62 @@ export async function handleChatCompletions(body, deps = {}) {
       acct = await waitForAccount(tried, null, QUEUE_MAX_WAIT_MS, modelKey);
       if (!acct) break;
     }
-    tried.push(acct.apiKey);
+    try {
+      tried.push(acct.apiKey);
 
-    // Pre-flight rate limit check (experimental): ask server.codeium.com if
-    // this account still has message capacity before burning an LS round trip.
-    if (isExperimentalEnabled('preflightRateLimit')) {
-      try {
-        const px = getEffectiveProxy(acct.id) || null;
-        const rl = await checkMessageRateLimit(acct.apiKey, px);
-        if (!rl.hasCapacity) {
-          log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
-          markRateLimited(acct.id, modelKey);
-          continue;
+      // Pre-flight rate limit check (experimental): ask server.codeium.com if
+      // this account still has message capacity before burning an LS round trip.
+      if (isExperimentalEnabled('preflightRateLimit')) {
+        try {
+          const px = getEffectiveProxy(acct.id) || null;
+          const rl = await checkMessageRateLimit(acct.apiKey, px);
+          if (!rl.hasCapacity) {
+            log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
+            markRateLimited(acct.id, modelKey);
+            continue;
+          }
+        } catch (e) {
+          log.debug(`Preflight check failed for ${acct.email}: ${e.message}`);
+          // Fail open — proceed with the request
         }
-      } catch (e) {
-        log.debug(`Preflight check failed for ${acct.email}: ${e.message}`);
-        // Fail open — proceed with the request
       }
-    }
 
-    await ensureLs(acct.proxy);
-    const ls = getLsFor(acct.proxy);
-    if (!ls) { lastErr = { status: 503, body: { error: { message: 'No LS instance available', type: 'ls_unavailable' } } }; break; }
-    // Cascade pins cascade_id to a specific LS port too; if the LS it was
-    // born on has been replaced, the cascade_id is dead.
-    if (reuseEntry && reuseEntry.lsPort !== ls.port) {
-      log.info('Chat: cascade reuse skipped — LS port changed');
-      reuseEntry = null;
+      await ensureLs(acct.proxy);
+      const ls = getLsFor(acct.proxy);
+      if (!ls) { lastErr = { status: 503, body: { error: { message: 'No LS instance available', type: 'ls_unavailable' } } }; break; }
+      // Cascade pins cascade_id to a specific LS port too; if the LS it was
+      // born on has been replaced, the cascade_id is dead.
+      if (reuseEntry && reuseEntry.lsPort !== ls.port) {
+        log.info('Chat: cascade reuse skipped — LS port changed');
+        reuseEntry = null;
+      }
+      log.info(`Chat: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} account=${acct.email} ls=${ls.port}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
+      const client = new WindsurfClient(acct.apiKey, ls.port, ls.csrfToken);
+      const result = await nonStreamResponse(
+        client, chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid,
+        useCascade, acct.apiKey, ckey,
+        reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey } : null,
+        emulateTools, toolPreamble,
+        source, creditMultiplier,
+      );
+      if (result.status === 200) return result;
+      reuseEntry = null; // don't try to reuse on the retry
+      lastErr = result;
+      const errType = result.body?.error?.type;
+      // Rate limit: this account is done for this model, try the next one
+      if (errType === 'rate_limit_exceeded') {
+        log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
+        continue;
+      }
+      // Model not available on this account (permission_denied, etc.)
+      if (errType === 'model_not_available') {
+        log.warn(`Account ${acct.email} cannot serve ${displayModel}, trying next account`);
+        continue;
+      }
+      break; // other errors (502, transport) — don't retry
+    } finally {
+      acct.release?.();
     }
-    log.info(`Chat: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} account=${acct.email} ls=${ls.port}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
-    const client = new WindsurfClient(acct.apiKey, ls.port, ls.csrfToken);
-    const result = await nonStreamResponse(
-      client, chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid,
-      useCascade, acct.apiKey, ckey,
-      reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey } : null,
-      emulateTools, toolPreamble,
-      source, creditMultiplier,
-    );
-    if (result.status === 200) return result;
-    reuseEntry = null; // don't try to reuse on the retry
-    lastErr = result;
-    const errType = result.body?.error?.type;
-    // Rate limit: this account is done for this model, try the next one
-    if (errType === 'rate_limit_exceeded') {
-      log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
-      continue;
-    }
-    // Model not available on this account (permission_denied, etc.)
-    if (errType === 'model_not_available') {
-      log.warn(`Account ${acct.email} cannot serve ${displayModel}, trying next account`);
-      continue;
-    }
-    break; // other errors (502, transport) — don't retry
   }
   // If all accounts exhausted, check if it's because they're all rate-limited
   if (!lastErr || lastErr.status === 429) {
@@ -699,35 +691,35 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             acct = await waitForAccount(tried, abortController.signal, QUEUE_MAX_WAIT_MS, modelKey);
             if (!acct) break;
           }
-          tried.push(acct.apiKey);
-          currentApiKey = acct.apiKey;
-
-          // Pre-flight rate limit check (experimental)
-          if (isExperimentalEnabled('preflightRateLimit')) {
-            try {
-              const px = getEffectiveProxy(acct.id) || null;
-              const rl = await checkMessageRateLimit(acct.apiKey, px);
-              if (!rl.hasCapacity) {
-                log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
-                markRateLimited(acct.id, modelKey);
-                continue;
-              }
-            } catch (e) {
-              log.debug(`Preflight check failed for ${acct.email}: ${e.message}`);
-            }
-          }
-
-          try { await ensureLs(acct.proxy); } catch (e) { lastErr = e; break; }
-          const ls = getLsFor(acct.proxy);
-          if (!ls) { lastErr = new Error('No LS instance available'); break; }
-          if (reuseEntry && reuseEntry.lsPort !== ls.port) {
-            log.info('Chat: cascade reuse skipped — LS port changed');
-            reuseEntry = null;
-          }
-          log.info(`Chat: model=${model} flow=${useCascade ? 'cascade' : 'legacy'} stream=true attempt=${attempt + 1} account=${acct.email} ls=${ls.port}${reuseEntry ? ' reuse=1' : ''}`);
-          const client = new WindsurfClient(acct.apiKey, ls.port, ls.csrfToken);
-          let cascadeResult = null;
           try {
+            tried.push(acct.apiKey);
+            currentApiKey = acct.apiKey;
+
+            // Pre-flight rate limit check (experimental)
+            if (isExperimentalEnabled('preflightRateLimit')) {
+              try {
+                const px = getEffectiveProxy(acct.id) || null;
+                const rl = await checkMessageRateLimit(acct.apiKey, px);
+                if (!rl.hasCapacity) {
+                  log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
+                  markRateLimited(acct.id, modelKey);
+                  continue;
+                }
+              } catch (e) {
+                log.debug(`Preflight check failed for ${acct.email}: ${e.message}`);
+              }
+            }
+
+            try { await ensureLs(acct.proxy); } catch (e) { lastErr = e; break; }
+            const ls = getLsFor(acct.proxy);
+            if (!ls) { lastErr = new Error('No LS instance available'); break; }
+            if (reuseEntry && reuseEntry.lsPort !== ls.port) {
+              log.info('Chat: cascade reuse skipped — LS port changed');
+              reuseEntry = null;
+            }
+            log.info(`Chat: model=${model} flow=${useCascade ? 'cascade' : 'legacy'} stream=true attempt=${attempt + 1} account=${acct.email} ls=${ls.port}${reuseEntry ? ' reuse=1' : ''}`);
+            const client = new WindsurfClient(acct.apiKey, ls.port, ls.csrfToken);
+            let cascadeResult = null;
             if (useCascade) {
               cascadeResult = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, {
                 onChunk, signal: abortController.signal, reuseEntry, toolPreamble,
@@ -825,6 +817,8 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               continue;
             }
             break;
+          } finally {
+            acct.release?.();
           }
         }
 

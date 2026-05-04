@@ -27,6 +27,7 @@ let _refreshTimerStarted = false;
 // weighted selection (accounts with more headroom are preferred).
 const TIER_RPM = { pro: 60, free: 10, unknown: 20, expired: 0 };
 const RPM_WINDOW_MS = 60 * 1000;
+const accountSlotWaiters = new Set();
 
 function rpmLimitFor(account) {
   return TIER_RPM[account.tier || 'unknown'] ?? 20;
@@ -39,6 +40,66 @@ function pruneRpmHistory(account, now) {
     account._rpmHistory.shift();
   }
   return account._rpmHistory.length;
+}
+
+function accountConcurrencyLimit() {
+  const max = config.accountMaxConcurrentChats;
+  return Number.isFinite(max) ? max : 1;
+}
+
+function getAccountInflight(account) {
+  return account._inflightChats || 0;
+}
+
+function tryAcquireAccountSlot(account) {
+  const max = accountConcurrencyLimit();
+  if (max > 0 && getAccountInflight(account) >= max) return null;
+  account._inflightChats = getAccountInflight(account) + 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    account._inflightChats = Math.max(0, getAccountInflight(account) - 1);
+    notifyAccountSlotWaiters();
+  };
+}
+
+function notifyAccountSlotWaiters() {
+  for (const wake of accountSlotWaiters) wake();
+}
+
+function waitForAccountSlot(signal, timeoutMs) {
+  return new Promise(resolve => {
+    let done = false;
+    let timer = null;
+    let wake = null;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      if (wake) accountSlotWaiters.delete(wake);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve(ok);
+    };
+    const onAbort = () => finish(false);
+    wake = () => finish(true);
+    accountSlotWaiters.add(wake);
+    timer = setTimeout(() => finish(false), Math.max(1, timeoutMs || 30000));
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function toCheckout(account) {
+  const release = tryAcquireAccountSlot(account);
+  if (!release) return null;
+  account._rpmHistory.push(Date.now());
+  account.lastUsed = Date.now();
+  return {
+    id: account.id, email: account.email, apiKey: account.apiKey,
+    apiServerUrl: account.apiServerUrl || '',
+    proxy: getEffectiveProxy(account.id) || null,
+    release,
+  };
 }
 
 function saveAccounts() {
@@ -367,6 +428,7 @@ export function getApiKey(excludeKeys = [], modelKey = null) {
     if (limit <= 0) continue; // expired tier
     const used = pruneRpmHistory(a, now);
     if (used >= limit) continue;
+    if (accountConcurrencyLimit() > 0 && getAccountInflight(a) >= accountConcurrencyLimit()) continue;
     // Tier entitlement + per-account blocklist filter
     if (modelKey && !isModelAllowedForAccount(a, modelKey)) continue;
     candidates.push({ account: a, used, limit });
@@ -382,14 +444,20 @@ export function getApiKey(excludeKeys = [], modelKey = null) {
     return (x.account.lastUsed || 0) - (y.account.lastUsed || 0);
   });
 
-  const { account } = candidates[0];
-  account._rpmHistory.push(now);
-  account.lastUsed = now;
-  return {
-    id: account.id, email: account.email, apiKey: account.apiKey,
-    apiServerUrl: account.apiServerUrl || '',
-    proxy: getEffectiveProxy(account.id) || null,
-  };
+  return toCheckout(candidates[0].account);
+}
+
+export async function waitForApiKey(excludeKeys = [], modelKey = null, signal = null, maxWaitMs = 30000) {
+  const deadline = Date.now() + maxWaitMs;
+  let acct = getApiKey(excludeKeys, modelKey);
+  while (!acct) {
+    if (signal?.aborted) return null;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    await waitForAccountSlot(signal, Math.min(1000, remaining));
+    acct = getApiKey(excludeKeys, modelKey);
+  }
+  return acct;
 }
 
 /**
@@ -410,13 +478,7 @@ export function acquireAccountByKey(apiKey, modelKey = null) {
   const used = pruneRpmHistory(a, now);
   if (used >= limit) return null;
   if (modelKey && !isModelAllowedForAccount(a, modelKey)) return null;
-  a._rpmHistory.push(now);
-  a.lastUsed = now;
-  return {
-    id: a.id, email: a.email, apiKey: a.apiKey,
-    apiServerUrl: a.apiServerUrl || '',
-    proxy: getEffectiveProxy(a.id) || null,
-  };
+  return toCheckout(a);
 }
 
 /**
@@ -599,6 +661,8 @@ export function getAccountList() {
       ) : {},
       rpmUsed,
       rpmLimit,
+      inflightChats: getAccountInflight(a),
+      maxConcurrentChats: accountConcurrencyLimit(),
       credits: a.credits || null,
       blockedModels: a.blockedModels || [],
       availableModels: getAvailableModelsForAccount(a),
