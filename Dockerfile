@@ -4,6 +4,11 @@
 # Language Server binary is built for glibc and does not run on Alpine/musl.
 FROM node:20-bookworm-slim
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # Non-root user for the app
 RUN groupadd --system --gid 101 app \
     && useradd --system --uid 101 --gid app --home-dir /app app
