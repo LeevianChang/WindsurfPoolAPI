@@ -1,7 +1,6 @@
 services:
   windsurfapi:
-    build: .
-    image: windsurfapi:latest
+    image: ghcr.io/leevianchang/windsurfpoolapi:latest
     container_name: windsurfapi
     restart: unless-stopped
     ports:
@@ -19,8 +18,10 @@ services:
       API_KEY: ""
     volumes:
       # Mount the Windsurf Language Server binary from the host. The binary is
-      # closed-source Windsurf and cannot be baked into the image.
-      - /opt/windsurf:/opt/windsurf:ro
+      # closed-source Windsurf and cannot be baked into the image. Docker
+      # Desktop for macOS does not share /opt by default, so use ./windsurf
+      # unless WINDSURF_HOST_DIR is set to another shared host path.
+      - ${WINDSURF_HOST_DIR:-./windsurf}:/opt/windsurf:ro
       # Persist runtime state across container restarts.
       # NOTE: If you bind-mount host files here, make sure they're readable/
       # writable by UID 101 (alpine 'app' user):

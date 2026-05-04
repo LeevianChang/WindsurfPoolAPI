@@ -23,6 +23,7 @@ ENV LOG_LEVEL=info
 
 # Writable locations for runtime state
 RUN mkdir -p /app/logs /tmp/windsurf-workspace \
+    && touch /app/accounts.json /app/stats.json /app/runtime-config.json /app/proxy-config.json /app/model-access.json \
     && chown -R app:app /app /tmp/windsurf-workspace
 
 USER app

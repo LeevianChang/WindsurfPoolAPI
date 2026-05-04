@@ -105,11 +105,25 @@ Dashboard: `http://localhost:3003/dashboard`
 
 ### Docker
 
+Place the LS binary in `./windsurf/` before starting:
+
 ```bash
-docker compose up -d --build
+mkdir -p windsurf
+cp /path/to/language_server_linux_x64 windsurf/
+chmod +x windsurf/language_server_linux_x64
 ```
 
-Mount the LS binary at `/opt/windsurf/` on the host before starting.
+```bash
+docker compose up -d
+```
+
+To use a different host location, set `WINDSURF_HOST_DIR` to a Docker-shared path:
+
+```bash
+WINDSURF_HOST_DIR=/path/to/windsurf docker compose up -d
+```
+
+The compose file pulls `ghcr.io/leevianchang/windsurfpoolapi:latest`. The image is built and published by GitHub Actions on pushes to `main`/`master`, version tags, or manual workflow runs.
 
 ---
 
