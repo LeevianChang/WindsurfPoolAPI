@@ -27,6 +27,45 @@ import { sanitizeText, PathSanitizeStream } from '../sanitize.js';
 const HEARTBEAT_MS = 5_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
 
+function classifyUpstreamError(err) {
+  const message = err?.message || String(err || '');
+  const lower = message.toLowerCase();
+
+  if (/content policy|blocked by our content policy|unsafe content|safety policy|policy violation/.test(lower)) {
+    return { action: 'return', status: 400, type: 'content_policy_block', tag: 'content_policy_block' };
+  }
+  if (/context.*(too long|length|limit)|prompt.*too long|input.*too long|token limit|max(?:imum)? context/.test(lower)) {
+    return { action: 'return', status: 400, type: 'context_too_long', tag: 'context_too_long' };
+  }
+  if (/rate limit|rate_limit|too many requests|quota/.test(lower)) {
+    return { action: 'switch_account', status: 429, type: 'rate_limit_exceeded', tag: 'rate_limit' };
+  }
+  if (/unauthenticated|invalid api key|invalid_grant|permission_denied.*account/.test(lower)) {
+    return { action: 'switch_account', status: 502, type: 'auth_error', tag: 'auth_error' };
+  }
+  if (/internal error occurred.*error id|overloaded|temporarily unavailable|timeout|timed out|stalled|unavailable|econnreset/.test(lower)) {
+    return { action: 'switch_account', status: 502, type: 'upstream_error', tag: 'transient_error' };
+  }
+  if (/permission_denied|failed_precondition|model.*not.*available|not entitled|not subscribed|does not have access/.test(lower)) {
+    return { action: 'switch_account', status: 403, type: 'model_not_available', tag: 'model_not_available', capabilityFailure: true };
+  }
+
+  return { action: 'return', status: err?.isModelError ? 403 : 502, type: err?.isModelError ? 'model_error' : 'upstream_error', tag: err?.isModelError ? 'model_error' : 'upstream_error' };
+}
+
+function applyErrorSideEffects(err, apiKey, modelKey) {
+  const cls = classifyUpstreamError(err);
+  if (cls.tag === 'auth_error') reportError(apiKey);
+  if (cls.tag === 'rate_limit') markRateLimited(apiKey, 5 * 60 * 1000, modelKey);
+  if (cls.tag === 'transient_error' && /internal error occurred.*error id/i.test(err?.message || '')) {
+    reportInternalError(apiKey);
+  }
+  if (err?.isModelError && cls.capabilityFailure) {
+    updateCapability(apiKey, modelKey, false, 'model_error');
+  }
+  return cls;
+}
+
 // ── Language-following reinforcement ──────────────────────────
 // Claude Code injects ~100KB of English system prompt + tool definitions
 // which drowns out the communication_section language instruction. Detecting
@@ -336,14 +375,11 @@ export async function handleChatCompletions(body, deps = {}) {
       reuseEntry = null; // don't try to reuse on the retry
       lastErr = result;
       const errType = result.body?.error?.type;
-      // Rate limit: this account is done for this model, try the next one
-      if (errType === 'rate_limit_exceeded') {
-        log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
-        continue;
-      }
-      // Model not available on this account (permission_denied, etc.)
-      if (errType === 'model_not_available') {
-        log.warn(`Account ${acct.email} cannot serve ${displayModel}, trying next account`);
+      // Only known account-specific or transient failures should move to the
+      // next account. Terminal upstream rejections (policy, bad input, context)
+      // are returned directly instead of trying to route around them.
+      if (result.body?.error?.retryable === true) {
+        log.warn(`Account ${acct.email} failed (${errType}) on ${displayModel}, trying next account`);
         continue;
       }
       break; // other errors (502, transport) — don't retry
@@ -486,33 +522,22 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       },
     };
   } catch (err) {
-    // Only count true auth failures against the account. Workspace/cascade/model
-    // errors and transport issues shouldn't disable the key.
-    const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
-    const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
-    const isInternal = /internal error occurred.*error id/i.test(err.message);
-    if (isAuthFail) reportError(apiKey);
-    if (isRateLimit) { markRateLimited(apiKey, 5 * 60 * 1000, modelKey); err.isRateLimit = true; err.isModelError = true; }
-    if (isInternal) { reportInternalError(apiKey); err.isModelError = true; }
-    if (err.isModelError && !isRateLimit && !isInternal) {
-      updateCapability(apiKey, modelKey, false, 'model_error');
-    }
+    const cls = applyErrorSideEffects(err, apiKey, modelKey);
     recordRequest({
       model, success: false, durationMs: Date.now() - startTime,
       accountId: apiKey, source, credit: 0, tokens: null,
     });
     log.error('Chat error:', err.message);
-    // Rate limits → 429 with Retry-After; model errors → 403; others → 502
-    if (isRateLimit) {
+    if (cls.tag === 'rate_limit') {
       const rl = isAllRateLimited(modelKey);
       return {
         status: 429,
-        body: { error: { message: `${model} 已达速率限制，请稍后重试`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs || 60000 } },
+        body: { error: { message: `${model} 已达速率限制，请稍后重试`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs || 60000, retryable: true } },
       };
     }
     return {
-      status: err.isModelError ? 403 : 502,
-      body: { error: { message: sanitizeText(err.message), type: err.isModelError ? 'model_not_available' : 'upstream_error' } },
+      status: cls.status,
+      body: { error: { message: sanitizeText(err.message), type: cls.type, retryable: cls.action === 'switch_account' } },
     };
   }
 }
@@ -801,19 +826,12 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           } catch (err) {
             lastErr = err;
             reuseEntry = null; // don't try to reuse on retry
-            const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
-            const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
-            const isInternal = /internal error occurred.*error id/i.test(err.message);
-            if (isAuthFail) reportError(currentApiKey);
-            if (isRateLimit) { markRateLimited(currentApiKey, 5 * 60 * 1000, modelKey); err.isRateLimit = true; err.isModelError = true; }
-            if (isInternal) { reportInternalError(currentApiKey); err.isModelError = true; }
-            if (err.isModelError && !isRateLimit && !isInternal) {
-              updateCapability(currentApiKey, modelKey, false, 'model_error');
-            }
-            // Retry only if nothing has been streamed yet AND it's a retryable error
-            if (!hadSuccess && (err.isModelError || isRateLimit)) {
-              const tag = isRateLimit ? 'rate_limit' : isInternal ? 'internal_error' : 'model_error';
-              log.warn(`Account ${acct.email} failed (${tag}) on ${model}, trying next`);
+            const cls = applyErrorSideEffects(err, currentApiKey, modelKey);
+            // Retry only if nothing has been streamed yet AND the classifier says
+            // the failure is account-specific or transient. Terminal upstream
+            // rejections must be returned directly.
+            if (!hadSuccess && cls.action === 'switch_account') {
+              log.warn(`Account ${acct.email} failed (${cls.tag}) on ${model}, trying next`);
               continue;
             }
             break;
