@@ -31,7 +31,7 @@ function positiveIntEnv(name, fallback) {
 const POOL_TTL_MS = positiveIntEnv('CASCADE_POOL_TTL_MS', 30 * 60 * 1000);
 const POOL_MAX = 500;
 
-// fingerprint -> { cascadeId, sessionId, lsPort, apiKey, createdAt, lastAccess }
+// fingerprint -> { cascadeId, sessionId, lsPort, apiKey, lastUserHash, requestShapeHash, createdAt, lastAccess }
 const _pool = new Map();
 // sessionKey -> latest fingerprint. This mirrors sub2api's sticky-session
 // layer: exact fingerprint is safest, session fallback preserves continuity
@@ -42,6 +42,15 @@ const stats = { hits: 0, sessionHits: 0, misses: 0, stores: 0, evictions: 0, exp
 
 function sha256(s) {
   return createHash('sha256').update(s).digest('hex');
+}
+
+function messageContentString(message) {
+  if (!message) return '';
+  if (typeof message.content === 'string') return message.content;
+  if (Array.isArray(message.content)) {
+    return message.content.map(p => (typeof p?.text === 'string' ? p.text : JSON.stringify(p))).join('');
+  }
+  return JSON.stringify(message.content ?? '');
 }
 
 // Client-injected meta tags whose bodies change every turn (cwd snapshot,
@@ -115,6 +124,28 @@ export function fingerprintAfter(messages, modelKey = '', callerKey = '') {
   return sha256(String(callerKey || '') + '\0' + modelKey + '\0' + JSON.stringify(canonicalise(turns)));
 }
 
+export function latestUserHash(messages, modelKey = '', callerKey = '') {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== 'user') continue;
+    const content = stripMetaTags(messageContentString(messages[i]));
+    return sha256(String(callerKey || '') + '\0' + modelKey + '\0' + content);
+  }
+  return '';
+}
+
+export function requestShapeHash(body = {}, modelKey = '', callerKey = '') {
+  if (!body || typeof body !== 'object') return '';
+  const shape = {};
+  for (const key of Object.keys(body).sort()) {
+    if (key === 'messages' || key === '_source') continue;
+    const value = body[key];
+    if (typeof value === 'undefined') continue;
+    shape[key] = value;
+  }
+  return sha256(String(callerKey || '') + '\0' + modelKey + '\0' + JSON.stringify(shape));
+}
+
 function prune(now) {
   for (const [fp, e] of _pool) {
     if (now - e.lastAccess > POOL_TTL_MS) { deleteFingerprint(fp); stats.expired++; }
@@ -149,7 +180,7 @@ function validEntry(entry, callerKey) {
  * fingerprint on success (or just drop it on failure and a fresh cascade
  * will be created next turn).
  */
-export function checkout(fingerprint, callerKey = '', sessionKey = '') {
+export function checkout(fingerprint, callerKey = '', sessionKey = '', opts = {}) {
   if (fingerprint) {
     const entry = _pool.get(fingerprint);
     if (validEntry(entry, callerKey)) {
@@ -167,6 +198,16 @@ export function checkout(fingerprint, callerKey = '', sessionKey = '') {
     const sessionFp = _sessionIndex.get(sessionKey);
     const entry = sessionFp ? _pool.get(sessionFp) : null;
     if (validEntry(entry, callerKey)) {
+      const currentLastUserHash = opts?.lastUserHash || '';
+      if (currentLastUserHash && entry.lastUserHash && currentLastUserHash === entry.lastUserHash) {
+        stats.misses++;
+        return null;
+      }
+      const currentRequestShapeHash = opts?.requestShapeHash || '';
+      if (currentRequestShapeHash && entry.requestShapeHash && currentRequestShapeHash !== entry.requestShapeHash) {
+        stats.misses++;
+        return null;
+      }
       deleteFingerprint(sessionFp);
       stats.sessionHits++;
       return { ...entry, reuseReason: 'session' };
@@ -192,6 +233,8 @@ export function checkin(fingerprint, entry, callerKey = '', sessionKey = '') {
     sessionId: entry.sessionId,
     lsPort: entry.lsPort,
     apiKey: entry.apiKey,
+    lastUserHash: entry.lastUserHash || '',
+    requestShapeHash: entry.requestShapeHash || '',
     callerKey: callerKey || entry.callerKey || '',
     sessionKey: sessionKey || entry.sessionKey || '',
     createdAt: entry.createdAt || now,

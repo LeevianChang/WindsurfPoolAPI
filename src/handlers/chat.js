@@ -16,7 +16,7 @@ import { isExperimentalEnabled, getIdentityPromptFor } from '../runtime-config.j
 import { checkMessageRateLimit } from '../windsurf-api.js';
 import { getEffectiveProxy } from '../dashboard/proxy-config.js';
 import {
-  fingerprintBefore, fingerprintAfter, checkout as poolCheckout, checkin as poolCheckin,
+  fingerprintBefore, fingerprintAfter, latestUserHash, requestShapeHash, checkout as poolCheckout, checkin as poolCheckin,
 } from '../conversation-pool.js';
 import {
   normalizeMessagesForCascade, ToolCallStreamParser, parseToolCallsFromText,
@@ -311,7 +311,9 @@ export async function handleChatCompletions(body, deps = {}) {
   // tool instead of replaying the whole transcript every turn.
   const reuseEnabled = useCascade && isExperimentalEnabled('cascadeConversationReuse');
   const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
-  let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey) : null;
+  const lastUserHash = reuseEnabled ? latestUserHash(messages, modelKey, callerKey) : '';
+  const shapeHash = reuseEnabled ? requestShapeHash(body, modelKey, callerKey) : '';
+  let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey, { lastUserHash, requestShapeHash: shapeHash }) : null;
   if (reuseEntry) log.info(`Chat: cascade reuse HIT reason=${reuseEntry.reuseReason || 'unknown'} cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… model=${displayModel}`);
 
   // Non-stream: retry with a different account on model-not-available errors
@@ -368,7 +370,7 @@ export async function handleChatCompletions(body, deps = {}) {
       const result = await nonStreamResponse(
         client, chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid,
         useCascade, acct.apiKey, ckey,
-        reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, sessionKey } : null,
+        reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, sessionKey, requestShapeHash: shapeHash } : null,
         emulateTools, toolPreamble,
         source, creditMultiplier,
       );
@@ -473,6 +475,8 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         sessionId: cascadeMeta.sessionId,
         lsPort: poolCtx.lsPort,
         apiKey: poolCtx.apiKey,
+        lastUserHash: latestUserHash(messages, modelKey, poolCtx.callerKey || ''),
+        requestShapeHash: poolCtx.requestShapeHash || '',
         createdAt: poolCtx.reuseEntry?.createdAt,
       }, poolCtx.callerKey || '', poolCtx.sessionKey || '');
     }
@@ -630,7 +634,9 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       // can resume the same cascade instead of replaying the whole transcript.
       const reuseEnabled = useCascade && isExperimentalEnabled('cascadeConversationReuse');
       const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
-      let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey) : null;
+      const lastUserHash = reuseEnabled ? latestUserHash(messages, modelKey, callerKey) : '';
+      const shapeHash = reuseEnabled ? requestShapeHash({ model, stream: true, tools: emulateTools ? true : undefined }, modelKey, callerKey) : '';
+      let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey, { lastUserHash, requestShapeHash: shapeHash }) : null;
       if (reuseEntry) log.info(`Chat: cascade reuse HIT reason=${reuseEntry.reuseReason || 'unknown'} cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
 
       // Always strip <tool_call>/<tool_result> blocks in Cascade mode.
@@ -797,6 +803,8 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
                 sessionId: cascadeResult.sessionId,
                 lsPort: ls.port,
                 apiKey: currentApiKey,
+                lastUserHash,
+                requestShapeHash: shapeHash,
                 createdAt: reuseEntry?.createdAt,
               }, callerKey, sessionKey);
             }
