@@ -254,11 +254,8 @@ export class WindsurfClient {
     try {
       // Step 1: Start cascade — with retry on panel-state-not-found
       let cascadeId;
-      const openCascade = async () => {
-        if (reuseEntry?.cascadeId) {
-          log.debug(`Cascade resumed: ${reuseEntry.cascadeId}`);
-          return reuseEntry.cascadeId;
-        }
+      let stepOffset = 0;
+      const startFreshCascade = async () => {
         const startProto = buildStartCascadeRequest(this.apiKey, sessionId);
         const startResp = await grpcUnary(
           this.port, this.csrfToken, `${LS_SERVICE}/StartCascade`, grpcFrame(startProto)
@@ -267,6 +264,13 @@ export class WindsurfClient {
         if (!id) throw new Error('StartCascade returned empty cascade_id');
         log.debug(`Cascade started: ${id}`);
         return id;
+      };
+      const openCascade = async () => {
+        if (reuseEntry?.cascadeId) {
+          log.debug(`Cascade resumed: ${reuseEntry.cascadeId}`);
+          return reuseEntry.cascadeId;
+        }
+        return startFreshCascade();
       };
       try {
         cascadeId = await openCascade();
@@ -302,7 +306,22 @@ export class WindsurfClient {
       // doesn't flag the user-channel system prompt as prompt injection.
       if (sysText) sysText = neutralizeIdentityForCascade(sysText);
 
-      const isResume = !!reuseEntry?.cascadeId;
+      let isResume = !!reuseEntry?.cascadeId;
+      if (isResume) {
+        try {
+          const priorStepsProto = buildGetTrajectoryStepsRequest(cascadeId, 0);
+          const priorStepsResp = await grpcUnary(
+            this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(priorStepsProto)
+          );
+          stepOffset = parseTrajectorySteps(priorStepsResp).length;
+        } catch (e) {
+          log.warn(`Cascade resume baseline failed, starting fresh: ${e.message}`);
+          reuseEntry.cascadeId = null;
+          isResume = false;
+          stepOffset = 0;
+          cascadeId = await startFreshCascade();
+        }
+      }
 
       if (isResume || convo.length <= 1) {
         const last = convo[convo.length - 1];
@@ -374,6 +393,7 @@ export class WindsurfClient {
         );
         cascadeId = parseStartCascadeResponse(startResp);
         if (!cascadeId) throw new Error('StartCascade returned empty cascade_id after re-warm');
+        stepOffset = 0;
         await sendMessage();
       }
 
@@ -425,7 +445,7 @@ export class WindsurfClient {
         pollCount++;
 
         // Get steps
-        const stepsProto = buildGetTrajectoryStepsRequest(cascadeId, 0);
+        const stepsProto = buildGetTrajectoryStepsRequest(cascadeId, stepOffset);
         const stepsResp = await grpcUnary(
           this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(stepsProto)
         );
@@ -662,7 +682,7 @@ export class WindsurfClient {
       // itself is already formed.
       let serverUsage = null;
       try {
-        const metaReq = buildGetGeneratorMetadataRequest(cascadeId, 0);
+        const metaReq = buildGetGeneratorMetadataRequest(cascadeId, stepOffset);
         const metaResp = await grpcUnary(
           this.port, this.csrfToken,
           `${LS_SERVICE}/GetCascadeTrajectoryGeneratorMetadata`,
