@@ -26,6 +26,7 @@ import { handleResponses } from './handlers/responses.js';
 import { handleDashboardApi } from './dashboard/api.js';
 import { config, log } from './config.js';
 import { callerKeyFromRequest } from './caller-key.js';
+import { sessionKeyFromRequest } from './session-key.js';
 import { VERSION } from './version.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -255,7 +256,8 @@ async function route(req, res) {
 
     await withChatConcurrency(res, async () => {
       body._source = 'POST /v1/chat/completions';
-      const result = await handleChatCompletions(body, { callerKey });
+      const sessionKey = sessionKeyFromRequest(req, body, callerKey);
+      const result = await handleChatCompletions(body, { callerKey, sessionKey });
       if (result.stream) {
         // Streaming tuning: keep the socket hot and unblock the first byte.
         //   setNoDelay — disable Nagle so small SSE deltas aren't coalesced (40ms win)
@@ -287,7 +289,7 @@ async function route(req, res) {
       return json(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request' } });
     }
     await withChatConcurrency(res, async () => {
-      const result = await handleResponses(body, { context: { callerKey } });
+      const result = await handleResponses(body, { context: { callerKey, sessionKey: sessionKeyFromRequest(req, body, callerKey) } });
       if (result.stream) {
         req.socket?.setKeepAlive(true);
         req.setTimeout(0);
@@ -316,7 +318,8 @@ async function route(req, res) {
       return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages must be a non-empty array' } });
     }
     await withChatConcurrency(res, async () => {
-      const result = await handleMessages(body, { callerKey });
+      const sessionKey = sessionKeyFromRequest(req, body, callerKey);
+      const result = await handleMessages(body, { callerKey, sessionKey });
       if (result.stream) {
         // Same streaming tuning as /v1/chat/completions — see comment above.
         req.socket?.setKeepAlive(true);

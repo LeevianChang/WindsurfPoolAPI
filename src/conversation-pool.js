@@ -33,8 +33,12 @@ const POOL_MAX = 500;
 
 // fingerprint -> { cascadeId, sessionId, lsPort, apiKey, createdAt, lastAccess }
 const _pool = new Map();
+// sessionKey -> latest fingerprint. This mirrors sub2api's sticky-session
+// layer: exact fingerprint is safest, session fallback preserves continuity
+// when clients compact or slightly reshape prior turns.
+const _sessionIndex = new Map();
 
-const stats = { hits: 0, misses: 0, stores: 0, evictions: 0, expired: 0 };
+const stats = { hits: 0, sessionHits: 0, misses: 0, stores: 0, evictions: 0, expired: 0 };
 
 function sha256(s) {
   return createHash('sha256').update(s).digest('hex');
@@ -76,15 +80,26 @@ function canonicalise(messages) {
   });
 }
 
+function hasToolCalls(message) {
+  return Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
+}
+
 /**
- * Fingerprint for "resume this conversation". Hash only stable caller-visible
- * turns: user messages and tool results. Assistant messages are excluded
- * because clients may restructure them between turns.
+ * Fingerprint for "resume this conversation". Hash stable caller-visible turns
+ * plus system instructions. Plain assistant text is excluded because clients
+ * may restructure it between turns, but assistant tool_call turns are kept so
+ * tool-result conversations resume the exact cascade that requested the tool.
  */
 function stableTurns(messages) {
   return messages
-    .filter(m => m.role === 'user' || m.role === 'tool')
-    .map(m => m.role === 'tool' ? { ...m, role: 'tool_result' } : m);
+    .filter(m => m.role === 'system' || m.role === 'user' || m.role === 'tool' || (m.role === 'assistant' && hasToolCalls(m)))
+    .map(m => {
+      if (m.role === 'tool') return { ...m, role: 'tool_result' };
+      if (m.role === 'assistant' && hasToolCalls(m)) {
+        return { role: 'assistant_tool_calls', content: JSON.stringify(m.tool_calls) };
+      }
+      return m;
+    });
 }
 
 export function fingerprintBefore(messages, modelKey = '', callerKey = '') {
@@ -102,15 +117,29 @@ export function fingerprintAfter(messages, modelKey = '', callerKey = '') {
 
 function prune(now) {
   for (const [fp, e] of _pool) {
-    if (now - e.lastAccess > POOL_TTL_MS) { _pool.delete(fp); stats.expired++; }
+    if (now - e.lastAccess > POOL_TTL_MS) { deleteFingerprint(fp); stats.expired++; }
   }
   if (_pool.size <= POOL_MAX) return;
   const entries = [..._pool.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess);
   const toDrop = entries.length - POOL_MAX;
   for (let i = 0; i < toDrop; i++) {
-    _pool.delete(entries[i][0]);
+    deleteFingerprint(entries[i][0]);
     stats.evictions++;
   }
+}
+
+function deleteFingerprint(fingerprint) {
+  const entry = _pool.get(fingerprint);
+  _pool.delete(fingerprint);
+  if (entry?.sessionKey && _sessionIndex.get(entry.sessionKey) === fingerprint) {
+    _sessionIndex.delete(entry.sessionKey);
+  }
+}
+
+function validEntry(entry, callerKey) {
+  if (!entry) return false;
+  if (entry.callerKey && callerKey && entry.callerKey !== callerKey) return false;
+  return Date.now() - entry.lastAccess <= POOL_TTL_MS;
 }
 
 /**
@@ -120,28 +149,42 @@ function prune(now) {
  * fingerprint on success (or just drop it on failure and a fresh cascade
  * will be created next turn).
  */
-export function checkout(fingerprint, callerKey = '') {
-  if (!fingerprint) { stats.misses++; return null; }
-  const entry = _pool.get(fingerprint);
-  if (!entry) { stats.misses++; return null; }
-  _pool.delete(fingerprint);
-  if (entry.callerKey && callerKey && entry.callerKey !== callerKey) {
-    stats.misses++;
-    return null;
+export function checkout(fingerprint, callerKey = '', sessionKey = '') {
+  if (fingerprint) {
+    const entry = _pool.get(fingerprint);
+    if (validEntry(entry, callerKey)) {
+      deleteFingerprint(fingerprint);
+      stats.hits++;
+      return { ...entry, reuseReason: 'fingerprint' };
+    }
+    if (entry) {
+      if (Date.now() - entry.lastAccess > POOL_TTL_MS) stats.expired++;
+      deleteFingerprint(fingerprint);
+    }
   }
-  if (Date.now() - entry.lastAccess > POOL_TTL_MS) {
-    stats.expired++;
-    stats.misses++;
-    return null;
+
+  if (sessionKey) {
+    const sessionFp = _sessionIndex.get(sessionKey);
+    const entry = sessionFp ? _pool.get(sessionFp) : null;
+    if (validEntry(entry, callerKey)) {
+      deleteFingerprint(sessionFp);
+      stats.sessionHits++;
+      return { ...entry, reuseReason: 'session' };
+    }
+    if (sessionFp) {
+      if (entry && Date.now() - entry.lastAccess > POOL_TTL_MS) stats.expired++;
+      deleteFingerprint(sessionFp);
+    }
   }
-  stats.hits++;
-  return entry;
+
+  stats.misses++;
+  return null;
 }
 
 /**
  * Store (or restore) a conversation entry under a new fingerprint.
  */
-export function checkin(fingerprint, entry, callerKey = '') {
+export function checkin(fingerprint, entry, callerKey = '', sessionKey = '') {
   if (!fingerprint || !entry) return;
   const now = Date.now();
   _pool.set(fingerprint, {
@@ -150,9 +193,12 @@ export function checkin(fingerprint, entry, callerKey = '') {
     lsPort: entry.lsPort,
     apiKey: entry.apiKey,
     callerKey: callerKey || entry.callerKey || '',
+    sessionKey: sessionKey || entry.sessionKey || '',
     createdAt: entry.createdAt || now,
     lastAccess: now,
   });
+  const key = sessionKey || entry.sessionKey || '';
+  if (key) _sessionIndex.set(key, fingerprint);
   stats.stores++;
   prune(now);
 }
@@ -165,7 +211,7 @@ export function invalidateFor({ apiKey, lsPort }) {
   let dropped = 0;
   for (const [fp, e] of _pool) {
     if ((apiKey && e.apiKey === apiKey) || (lsPort && e.lsPort === lsPort)) {
-      _pool.delete(fp);
+      deleteFingerprint(fp);
       dropped++;
     }
   }
@@ -175,11 +221,12 @@ export function invalidateFor({ apiKey, lsPort }) {
 export function poolStats() {
   return {
     size: _pool.size,
+    sessionIndexSize: _sessionIndex.size,
     maxSize: POOL_MAX,
     ttlMs: POOL_TTL_MS,
     ...stats,
-    hitRate: stats.hits + stats.misses > 0
-      ? ((stats.hits / (stats.hits + stats.misses)) * 100).toFixed(1)
+    hitRate: stats.hits + stats.sessionHits + stats.misses > 0
+      ? (((stats.hits + stats.sessionHits) / (stats.hits + stats.sessionHits + stats.misses)) * 100).toFixed(1)
       : '0.0',
   };
 }
@@ -187,6 +234,7 @@ export function poolStats() {
 export function poolClear() {
   const n = _pool.size;
   _pool.clear();
+  _sessionIndex.clear();
   return n;
 }
 

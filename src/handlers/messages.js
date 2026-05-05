@@ -19,6 +19,7 @@ import { randomUUID } from 'crypto';
 import { handleChatCompletions } from './chat.js';
 import { resolveModel } from '../models.js';
 import { config, log } from '../config.js';
+import { sessionKeyFromAnthropicBody } from '../session-key.js';
 
 // ── Model name aliasing ────────────────────────────────────
 // Claude Code sends names like "claude-opus-4-5-20250929" or the bare alias
@@ -660,6 +661,10 @@ export async function handleMessages(anthropicBody, deps = {}) {
   }
   const openaiBody = buildOpenAIBody(anthropicBody);
   const requestedModel = anthropicBody.model || openaiBody.model;
+  const depsWithSession = {
+    ...deps,
+    sessionKey: deps.sessionKey || sessionKeyFromAnthropicBody(anthropicBody, deps.callerKey || deps.context?.callerKey || ''),
+  };
 
   const inEffort = anthropicBody.output_config?.effort || anthropicBody.effort || null;
   log.info(`Messages: anthropic→openai model=${anthropicBody.model}${inEffort ? ` effort=${inEffort}` : ''} → ${openaiBody.model} stream=${openaiBody.stream} msgs=${openaiBody.messages.length} tools=${openaiBody.tools?.length || 0}`);
@@ -670,7 +675,7 @@ export async function handleMessages(anthropicBody, deps = {}) {
 
   // Non-stream path: delegate and re-shape the body.
   if (!openaiBody.stream) {
-    const result = await handleChatCompletions(openaiBody, deps);
+    const result = await handleChatCompletions(openaiBody, depsWithSession);
     if (result.status !== 200) {
       // Re-shape the error envelope to Anthropic's shape
       const msg = result.body?.error?.message || 'Unknown error';
@@ -700,7 +705,7 @@ export async function handleMessages(anthropicBody, deps = {}) {
   }
 
   // Stream path: delegate and wrap the response with our transform.
-  const result = await handleChatCompletions(openaiBody, deps);
+  const result = await handleChatCompletions(openaiBody, depsWithSession);
   if (result.status !== 200 || !result.stream) {
     // Upstream returned a synchronous error before streaming started — re-shape
     const msg = result.body?.error?.message || 'Upstream failed to start stream';

@@ -199,6 +199,7 @@ export async function handleChatCompletions(body, deps = {}) {
   const creditMultiplier = modelInfo?.credit || 0;
   const source = body._source || 'POST /v1/chat/completions';
   const callerKey = deps.callerKey || deps.context?.callerKey || '';
+  const sessionKey = deps.sessionKey || deps.context?.sessionKey || '';
   const modelEnum = modelInfo?.enumValue || 0;
   const modelUid = modelInfo?.modelUid || null;
   // Models with a modelUid use the Cascade flow (StartCascade → SendUserCascadeMessage).
@@ -276,7 +277,7 @@ export async function handleChatCompletions(body, deps = {}) {
   const ckey = cacheKey(body);
 
   if (stream) {
-    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source, creditMultiplier, callerKey);
+    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source, creditMultiplier, callerKey, sessionKey);
   }
 
   // ── Local response cache (exact body match) ─────────────
@@ -305,13 +306,13 @@ export async function handleChatCompletions(body, deps = {}) {
   // pair so the Windsurf backend serves from its hot per-cascade context
   // instead of replaying the whole history.
   //
-  // Tool-emulation mode bypasses the reuse pool: fingerprint can't stably
-  // collapse a conversation whose assistant turns contain synthesised
-  // <tool_call> markup and whose user turns contain <tool_result> wrappers.
-  const reuseEnabled = useCascade && !emulateTools && isExperimentalEnabled('cascadeConversationReuse');
+  // Reuse Cascade state whenever possible. The fingerprint canonicalises tool
+  // turns so tool-result conversations can keep the cascade that requested the
+  // tool instead of replaying the whole transcript every turn.
+  const reuseEnabled = useCascade && isExperimentalEnabled('cascadeConversationReuse');
   const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
-  let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey) : null;
-  if (reuseEntry) log.info(`Chat: cascade reuse HIT cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… model=${displayModel}`);
+  let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey) : null;
+  if (reuseEntry) log.info(`Chat: cascade reuse HIT reason=${reuseEntry.reuseReason || 'unknown'} cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… model=${displayModel}`);
 
   // Non-stream: retry with a different account on model-not-available errors
   const tried = [];
@@ -367,7 +368,7 @@ export async function handleChatCompletions(body, deps = {}) {
       const result = await nonStreamResponse(
         client, chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid,
         useCascade, acct.apiKey, ckey,
-        reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey } : null,
+        reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, sessionKey } : null,
         emulateTools, toolPreamble,
         source, creditMultiplier,
       );
@@ -451,17 +452,29 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       }));
     }
 
+    const responseToolCalls = toolCalls.map((tc, i) => ({
+      id: tc.id || `call_${i}_${Date.now().toString(36)}`,
+      type: 'function',
+      function: {
+        name: tc.name || 'unknown',
+        arguments: tc.argumentsJson || tc.arguments || '{}',
+      },
+    }));
+
     // Check the cascade back into the pool under the *post-turn* fingerprint
     // so the next request in the same conversation can resume it.
-    if (poolCtx && cascadeMeta?.cascadeId && allText) {
-      const fpAfter = fingerprintAfter(messages, modelKey, poolCtx.callerKey || '');
+    if (poolCtx && cascadeMeta?.cascadeId && (allText || responseToolCalls.length)) {
+      const poolMessages = responseToolCalls.length
+        ? [...messages, { role: 'assistant', content: null, tool_calls: responseToolCalls }]
+        : messages;
+      const fpAfter = fingerprintAfter(poolMessages, modelKey, poolCtx.callerKey || '');
       poolCheckin(fpAfter, {
         cascadeId: cascadeMeta.cascadeId,
         sessionId: cascadeMeta.sessionId,
         lsPort: poolCtx.lsPort,
         apiKey: poolCtx.apiKey,
         createdAt: poolCtx.reuseEntry?.createdAt,
-      }, poolCtx.callerKey || '');
+      }, poolCtx.callerKey || '', poolCtx.sessionKey || '');
     }
 
     reportSuccess(apiKey);
@@ -491,15 +504,8 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
 
     const message = { role: 'assistant', content: allText || null };
     if (allThinking) message.reasoning_content = allThinking;
-    if (toolCalls.length) {
-      message.tool_calls = toolCalls.map((tc, i) => ({
-        id: tc.id || `call_${i}_${Date.now().toString(36)}`,
-        type: 'function',
-        function: {
-          name: tc.name || 'unknown',
-          arguments: tc.argumentsJson || tc.arguments || '{}',
-        },
-      }));
+    if (responseToolCalls.length) {
+      message.tool_calls = responseToolCalls;
       // OpenAI convention: content is null when finish_reason is tool_calls.
       // In text emulation the model often emits an inline answer alongside the
       // <tool_call> block (e.g., hallucinated weather data). Set content to
@@ -512,7 +518,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // Prefer server-reported usage; fall back to chars/4 estimate only when
     // the trajectory didn't include a ModelUsageStats field.
     const usage = buildUsageBody(serverUsage, messages, allText, allThinking);
-    const finishReason = toolCalls.length ? 'tool_calls' : 'stop';
+    const finishReason = responseToolCalls.length ? 'tool_calls' : 'stop';
     return {
       status: 200,
       body: {
@@ -542,7 +548,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
   }
 }
 
-function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source = 'POST /v1/chat/completions', creditMultiplier = 0, callerKey = '') {
+function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source = 'POST /v1/chat/completions', creditMultiplier = 0, callerKey = '', sessionKey = '') {
   return {
     status: 200,
     stream: true,
@@ -619,13 +625,13 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       let accText = '';
       let accThinking = '';
 
-      // Cascade conversation pool (experimental, stream path) — bypassed in
-      // tool-emulation mode because the fingerprint can't collapse turns
-      // whose bodies carry <tool_call>/<tool_result> markup.
-      const reuseEnabled = useCascade && !emulateTools && isExperimentalEnabled('cascadeConversationReuse');
+      // Cascade conversation pool (experimental, stream path). Tool-call
+      // turns are canonicalised by the fingerprint so tool-result follow-ups
+      // can resume the same cascade instead of replaying the whole transcript.
+      const reuseEnabled = useCascade && isExperimentalEnabled('cascadeConversationReuse');
       const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
-      let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey) : null;
-      if (reuseEntry) log.info(`Chat: cascade reuse HIT cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
+      let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey) : null;
+      if (reuseEntry) log.info(`Chat: cascade reuse HIT reason=${reuseEntry.reuseReason || 'unknown'} cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
 
       // Always strip <tool_call>/<tool_result> blocks in Cascade mode.
       // In emulation mode, parsed calls are emitted as OpenAI tool_calls.
@@ -773,15 +779,26 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             emitContent(pathStreamText.flush());
             emitThinking(pathStreamThinking.flush());
             // Pool check-in on success (cascade only)
-            if (reuseEnabled && cascadeResult?.cascadeId && accText) {
-              const fpAfter = fingerprintAfter(messages, modelKey, callerKey);
+            if (reuseEnabled && cascadeResult?.cascadeId && (accText || collectedToolCalls.length)) {
+              const responseToolCalls = collectedToolCalls.map((tc, i) => ({
+                id: tc.id || `call_${i}_${Date.now().toString(36)}`,
+                type: 'function',
+                function: {
+                  name: tc.name || 'unknown',
+                  arguments: sanitizeText(tc.argumentsJson || '{}'),
+                },
+              }));
+              const poolMessages = responseToolCalls.length
+                ? [...messages, { role: 'assistant', content: null, tool_calls: responseToolCalls }]
+                : messages;
+              const fpAfter = fingerprintAfter(poolMessages, modelKey, callerKey);
               poolCheckin(fpAfter, {
                 cascadeId: cascadeResult.cascadeId,
                 sessionId: cascadeResult.sessionId,
                 lsPort: ls.port,
                 apiKey: currentApiKey,
                 createdAt: reuseEntry?.createdAt,
-              }, callerKey);
+              }, callerKey, sessionKey);
             }
             // success
             if (hadSuccess) reportSuccess(currentApiKey);
