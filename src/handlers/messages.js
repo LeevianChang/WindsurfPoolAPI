@@ -576,7 +576,12 @@ class AnthropicStreamTransform {
     this._closeThinkingBlock();
     this._sendEvent('message_delta', {
       delta: { stop_reason: this.stopReason, stop_sequence: null },
-      usage: { output_tokens: this.usage.output_tokens || 0 },
+      usage: {
+        input_tokens: this.usage.input_tokens || 0,
+        output_tokens: this.usage.output_tokens || 0,
+        cache_creation_input_tokens: this.usage.cache_creation_input_tokens || 0,
+        cache_read_input_tokens: this.usage.cache_read_input_tokens || 0,
+      },
     });
     this._sendEvent('message_stop', {});
     if (!this.real.writableEnded) this.real.end();
