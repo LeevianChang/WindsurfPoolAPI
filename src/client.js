@@ -698,6 +698,7 @@ export class WindsurfClient {
       // that iterate over it keep working.
       chunks.cascadeId = cascadeId;
       chunks.sessionId = sessionId;
+      chunks.endReason = endReason;
       chunks.toolCalls = toolCalls;
       chunks.usage = serverUsage;
       if (serverUsage) {

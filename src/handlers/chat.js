@@ -418,7 +418,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         if (c.text) allText += c.text;
         if (c.thinking) allThinking += c.thinking;
       }
-      cascadeMeta = { cascadeId: chunks.cascadeId, sessionId: chunks.sessionId };
+      cascadeMeta = { cascadeId: chunks.cascadeId, sessionId: chunks.sessionId, endReason: chunks.endReason };
       serverUsage = chunks.usage || null;
       // Always strip <tool_call>/<tool_result> blocks from Cascade text.
       // - emulateTools=true: parsed tool_calls become OpenAI-format tool_calls.
@@ -465,7 +465,10 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
 
     // Check the cascade back into the pool under the *post-turn* fingerprint
     // so the next request in the same conversation can resume it.
-    if (poolCtx && cascadeMeta?.cascadeId && (allText || responseToolCalls.length)) {
+    if (poolCtx && cascadeMeta?.cascadeId && cascadeMeta.endReason && cascadeMeta.endReason !== 'idle_done') {
+      log.info(`Chat: cascade pool checkin skipped reason=${cascadeMeta.endReason} cascadeId=${cascadeMeta.cascadeId.slice(0, 8)}…`);
+    }
+    if (poolCtx && cascadeMeta?.cascadeId && cascadeMeta.endReason === 'idle_done' && (allText || responseToolCalls.length)) {
       const poolMessages = responseToolCalls.length
         ? [...messages, { role: 'assistant', content: null, tool_calls: responseToolCalls }]
         : messages;
@@ -785,7 +788,10 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             emitContent(pathStreamText.flush());
             emitThinking(pathStreamThinking.flush());
             // Pool check-in on success (cascade only)
-            if (reuseEnabled && cascadeResult?.cascadeId && (accText || collectedToolCalls.length)) {
+            if (reuseEnabled && cascadeResult?.cascadeId && cascadeResult.endReason && cascadeResult.endReason !== 'idle_done') {
+              log.info(`Chat: cascade pool checkin skipped reason=${cascadeResult.endReason} cascadeId=${cascadeResult.cascadeId.slice(0, 8)}…`);
+            }
+            if (reuseEnabled && cascadeResult?.cascadeId && cascadeResult.endReason === 'idle_done' && (accText || collectedToolCalls.length)) {
               const responseToolCalls = collectedToolCalls.map((tc, i) => ({
                 id: tc.id || `call_${i}_${Date.now().toString(36)}`,
                 type: 'function',
