@@ -88,6 +88,12 @@ Rules:
 4. After emitting the last <tool_call> block, STOP. Do not write any explanation after it. The caller executes the functions and returns results wrapped in <tool_result tool_call_id="...">...</tool_result> tags in the next user turn.
 5. NEVER say "I don't have access to tools" or "I cannot perform that action" — the functions listed below ARE your available tools.`;
 
+const CLAUDE_CODE_TOOL_HINT = `
+6. When the user asks you to inspect project files, call the appropriate read/list/search function.
+7. When the user asks you to change code or files, you MUST call the appropriate edit/write/apply-patch function. Do not only describe the edit.
+8. If you need context before editing, call read/list/search first, then call edit/write/apply-patch in a later turn after the tool result is returned.
+9. For Claude Code style tools, prefer Edit/MultiEdit/Write for file modifications and Read/Glob/Grep for inspection when those functions are available.`;
+
 // Behaviour suffix appended after the base rules, controlled by tool_choice.
 const TOOL_CHOICE_SUFFIX = {
   // "auto" (default): prefer tools over direct answers when a tool is relevant
@@ -123,6 +129,7 @@ export function buildToolPreambleForProto(tools, toolChoice) {
   const lines = [TOOL_PROTOCOL_SYSTEM_HEADER];
   // Append the appropriate behaviour suffix
   lines.push(TOOL_CHOICE_SUFFIX[mode] || TOOL_CHOICE_SUFFIX.auto);
+  lines.push(CLAUDE_CODE_TOOL_HINT);
   if (forceName) {
     lines.push(`7. You MUST call the function "${forceName}". No other function and no direct answer.`);
   }

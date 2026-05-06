@@ -75,26 +75,31 @@ const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf]/;
 const JP_RE  = /[\u3040-\u309f\u30a0-\u30ff]/;
 const KR_RE  = /[\uac00-\ud7af]/;
 
-function injectLanguageHint(msgs) {
-  if (!Array.isArray(msgs)) return;
+function detectLanguageHint(msgs) {
+  if (!Array.isArray(msgs)) return { text: '', code: '' };
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i]?.role !== 'user') continue;
     const c = msgs[i].content;
     const text = typeof c === 'string' ? c
       : Array.isArray(c) ? c.filter(p => p?.type === 'text').map(p => p.text).join('') : '';
-    let hint = '';
     // Check JP/KR FIRST — Japanese text always contains kanji (CJK range)
     // so checking CJK first would false-match Japanese as Chinese.
-    if (JP_RE.test(text))       hint = '\n\n[IMPORTANT: You MUST respond entirely in Japanese (日本語). Do not switch to English.]';
-    else if (KR_RE.test(text))  hint = '\n\n[IMPORTANT: You MUST respond entirely in Korean (한국어). Do not switch to English.]';
-    else if (CJK_RE.test(text)) hint = '\n\n[IMPORTANT: You MUST respond entirely in Chinese (中文). Do not switch to English.]';
-    if (!hint) break;
+    if (JP_RE.test(text)) return { text: '[重要: 最後まで日本語だけで返答してください。英語に切り替えないでください。]', code: 'ja' };
+    if (KR_RE.test(text)) return { text: '[중요: 끝까지 한국어로만 답변하세요. 영어로 전환하지 마세요.]', code: 'ko' };
+    if (CJK_RE.test(text)) return { text: '[重要：请全程只用中文回答。不要在回答过程中切换成英文。]', code: 'zh' };
+    return { text: '', code: '' };
+  }
+  return { text: '', code: '' };
+}
+
+function injectLanguageHint(msgs, hintText) {
+  if (!Array.isArray(msgs) || !hintText) return;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role !== 'user') continue;
     msgs[i] = { ...msgs[i] };
-    if (typeof msgs[i].content === 'string') {
-      msgs[i].content += hint;
-    } else if (Array.isArray(msgs[i].content)) {
-      msgs[i].content = [...msgs[i].content, { type: 'text', text: hint }];
-    }
+    const hint = '\n\n' + hintText;
+    if (typeof msgs[i].content === 'string') msgs[i].content += hint;
+    else if (Array.isArray(msgs[i].content)) msgs[i].content = [...msgs[i].content, { type: 'text', text: hint }];
     break;
   }
 }
@@ -244,7 +249,8 @@ export async function handleChatCompletions(body, deps = {}) {
   // Language-following reinforcement: inject hint into latest user message
   // so the model responds in the user's language even when drowned in English
   // system prompts.
-  injectLanguageHint(cascadeMessages);
+  const languageHint = detectLanguageHint(cascadeMessages);
+  injectLanguageHint(cascadeMessages, languageHint.text);
 
   // Global model access control (allowlist / blocklist from dashboard)
   const access = isModelAllowed(modelKey);
@@ -274,10 +280,10 @@ export async function handleChatCompletions(body, deps = {}) {
 
   const chatId = genId();
   const created = Math.floor(Date.now() / 1000);
-  const ckey = cacheKey(body, callerKey);
+  const ckey = emulateTools ? null : cacheKey(body, callerKey);
 
   if (stream) {
-    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source, creditMultiplier, callerKey, sessionKey, body);
+    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, languageHint, source, creditMultiplier, callerKey, sessionKey, body);
   }
 
   // ── Local response cache (exact body match) ─────────────
@@ -372,7 +378,7 @@ export async function handleChatCompletions(body, deps = {}) {
         client, chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid,
         useCascade, acct.apiKey, ckey,
         reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, sessionKey, requestShapeHash: shapeHash } : null,
-        emulateTools, toolPreamble,
+        emulateTools, toolPreamble, languageHint,
         source, creditMultiplier,
       );
       if (result.status === 200) return result;
@@ -401,7 +407,7 @@ export async function handleChatCompletions(body, deps = {}) {
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, source = 'POST /v1/chat/completions', creditMultiplier = 0) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, languageHint, source = 'POST /v1/chat/completions', creditMultiplier = 0) {
   const startTime = Date.now();
   try {
     let allText = '';
@@ -414,7 +420,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     let serverUsage = null;
 
     if (useCascade) {
-      const chunks = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, { reuseEntry: poolCtx?.reuseEntry || null, toolPreamble });
+      const chunks = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, { reuseEntry: poolCtx?.reuseEntry || null, toolPreamble, languageHint });
       for (const c of chunks) {
         if (c.text) allText += c.text;
         if (c.thinking) allThinking += c.thinking;
@@ -556,7 +562,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
   }
 }
 
-function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source = 'POST /v1/chat/completions', creditMultiplier = 0, callerKey = '', sessionKey = '', requestBody = {}) {
+function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, languageHint, source = 'POST /v1/chat/completions', creditMultiplier = 0, callerKey = '', sessionKey = '', requestBody = {}) {
   return {
     status: 200,
     stream: true,
@@ -764,7 +770,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             let cascadeResult = null;
             if (useCascade) {
               cascadeResult = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, {
-                onChunk, signal: abortController.signal, reuseEntry, toolPreamble,
+                onChunk, signal: abortController.signal, reuseEntry, toolPreamble, languageHint,
               });
             } else {
               await client.rawGetChatMessage(messages, modelEnum, modelUid, { onChunk });

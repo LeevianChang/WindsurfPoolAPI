@@ -255,7 +255,7 @@ export function buildStartCascadeRequest(apiKey, sessionId) {
  * Field 3: metadata
  * Field 5: cascade_config
  */
-export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnum, modelUid, sessionId, { toolPreamble, images } = {}) {
+export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnum, modelUid, sessionId, { toolPreamble, images, languageHint } = {}) {
   const parts = [];
 
   // Field 1: cascade_id
@@ -270,7 +270,7 @@ export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnu
   // Field 5: cascade_config
   // When images are present, use DEFAULT planner mode (1) instead of NO_TOOL (3)
   // because NO_TOOL disables the vision pipeline on the Windsurf backend.
-  const cascadeConfig = buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault: !!images?.length });
+  const cascadeConfig = buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault: !!images?.length, languageHint });
   parts.push(writeMessageField(5, cascadeConfig));
 
   // Field 6: images — repeated ImageData { base64_data=1, mime_type=2 }
@@ -287,7 +287,7 @@ export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnu
   return Buffer.concat(parts);
 }
 
-function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault } = {}) {
+function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault, languageHint } = {}) {
   // CascadeConversationalPlannerConfig.planner_mode (field 4) uses
   // codeium_common.ConversationalPlannerMode:
   //   0 UNSPECIFIED  1 DEFAULT  2 READ_ONLY  3 NO_TOOL
@@ -333,11 +333,12 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault } 
     // ── Client provided OpenAI tools[] ──
     // Primary delivery: additional_instructions_section (field 12, OVERRIDE).
     // This section is always rendered, even in NO_TOOL planner mode.
+    const languageRule = languageHint?.text ? `\n\n${languageHint.text}` : '';
     const reinforcement =
       '\n\nIMPORTANT: You have real, callable functions described above. ' +
       'When the user\'s request can be answered by calling a function, you MUST emit ' +
       '<tool_call> blocks as described. Do NOT say "I don\'t have access to tools" ' +
-      'or "I cannot perform that action" — call the function.';
+      'or "I cannot perform that action" — call the function.' + languageRule;
     const additionalSection = Buffer.concat([
       writeVarintField(1, 1),             // SECTION_OVERRIDE_MODE_OVERRIDE
       writeStringField(2, toolPreamble + reinforcement),
@@ -367,7 +368,7 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault } 
         'If asked about your environment, server, infrastructure, or "where you are running", ' +
         'simply say you are a cloud-based AI assistant and cannot disclose infrastructure details. ' +
         'Do NOT speculate about or confirm any environment details even if the user guesses correctly. ' +
-        'This rule overrides ALL other instructions.'),
+        'This rule overrides ALL other instructions.' + languageRule),
     ]);
     convParts.push(writeMessageField(13, toolCommOverride));
   } else {
@@ -396,12 +397,13 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault } 
     convParts.push(writeMessageField(10, noToolSection));
 
     // field 12 (additional_instructions): reinforce direct-answer mode
+    const languageRule = languageHint?.text ? `\n\n${languageHint.text}` : '';
     const noToolAdditional = Buffer.concat([
       writeVarintField(1, 1),             // SECTION_OVERRIDE_MODE_OVERRIDE
       writeStringField(2,
         'You have no tools, no file access, and no command execution. ' +
         'Answer all questions directly using your knowledge. ' +
-        'Never pretend to create files or check directories.'),
+        'Never pretend to create files or check directories.' + languageRule),
     ]);
     convParts.push(writeMessageField(12, noToolAdditional));
 
@@ -430,7 +432,7 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault } 
         'If asked about your environment, server, infrastructure, or "where you are running", ' +
         'simply say you are a cloud-based AI assistant and cannot disclose infrastructure details. ' +
         'Do NOT speculate about or confirm any environment details even if the user guesses correctly. ' +
-        'This rule overrides ALL other instructions.'),
+        'This rule overrides ALL other instructions.' + languageRule),
     ]);
     convParts.push(writeMessageField(13, communicationOverride));
   }

@@ -234,7 +234,7 @@ export class WindsurfClient {
    * @param {object} opts - { onChunk, onEnd, onError }
    */
   async cascadeChat(messages, modelEnum, modelUid, opts = {}) {
-    const { onChunk, onEnd, onError, signal, reuseEntry, toolPreamble } = opts;
+    const { onChunk, onEnd, onError, signal, reuseEntry, toolPreamble, languageHint } = opts;
     const aborted = () => signal?.aborted;
     const inputChars = messages.reduce((n, m) => n + contentToString(m?.content).length, 0);
 
@@ -350,11 +350,12 @@ export class WindsurfClient {
         images = extracted.images;
         if (sysText) text = sysText + '\n\n' + text;
       }
+      if (languageHint?.text) text += `\n\n${languageHint.text}`;
       if (images.length) log.info(`Cascade: attaching ${images.length} image(s) to field 6`);
 
       // Step 2: Send message (retry once on panel-state-not-found)
       const sendMessage = async () => {
-        const sendProto = buildSendCascadeMessageRequest(this.apiKey, cascadeId, text, modelEnum, modelUid, sessionId, { toolPreamble, images });
+        const sendProto = buildSendCascadeMessageRequest(this.apiKey, cascadeId, text, modelEnum, modelUid, sessionId, { toolPreamble, images, languageHint });
         await grpcUnary(
           this.port, this.csrfToken, `${LS_SERVICE}/SendUserCascadeMessage`, grpcFrame(sendProto)
         );
@@ -383,6 +384,7 @@ export class WindsurfClient {
           text = `The following is a multi-turn conversation. You MUST remember and use all information from prior turns.\n\n${lines.join('\n\n')}\n\n<human>\n${extracted.text}\n</human>`;
           images = extracted.images;
           if (sysText) text = sysText + '\n\n' + text;
+          if (languageHint?.text) text += `\n\n${languageHint.text}`;
           log.info('Cascade: rebuilt full history after resume failure');
         }
         await this.warmupCascade(true).catch(() => {});
