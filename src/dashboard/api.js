@@ -91,7 +91,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     const flags = setExperimental(body || {});
     // Dropping the toggle should also drop any live entries so nothing
     // resumes against a disabled feature on the next request.
-    if (!flags.cascadeConversationReuse) convPoolClear();
+    if (!flags.cascadeConversationReuse || !flags.cascadeSessionFallbackReuse) convPoolClear();
     return json(res, 200, { success: true, flags });
   }
   if (subpath === '/experimental/conversation-pool' && method === 'DELETE') {

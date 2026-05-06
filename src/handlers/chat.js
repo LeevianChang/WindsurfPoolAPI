@@ -274,10 +274,10 @@ export async function handleChatCompletions(body, deps = {}) {
 
   const chatId = genId();
   const created = Math.floor(Date.now() / 1000);
-  const ckey = cacheKey(body);
+  const ckey = cacheKey(body, callerKey);
 
   if (stream) {
-    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source, creditMultiplier, callerKey, sessionKey);
+    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source, creditMultiplier, callerKey, sessionKey, body);
   }
 
   // ── Local response cache (exact body match) ─────────────
@@ -313,7 +313,8 @@ export async function handleChatCompletions(body, deps = {}) {
   const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
   const lastUserHash = reuseEnabled ? latestUserHash(messages, modelKey, callerKey) : '';
   const shapeHash = reuseEnabled ? requestShapeHash(body, modelKey, callerKey) : '';
-  let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey, { lastUserHash, requestShapeHash: shapeHash }) : null;
+  const allowSessionFallback = reuseEnabled && isExperimentalEnabled('cascadeSessionFallbackReuse');
+  let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey, { lastUserHash, requestShapeHash: shapeHash, allowSessionFallback }) : null;
   if (reuseEntry) log.info(`Chat: cascade reuse HIT reason=${reuseEntry.reuseReason || 'unknown'} cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… model=${displayModel}`);
 
   // Non-stream: retry with a different account on model-not-available errors
@@ -555,7 +556,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
   }
 }
 
-function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source = 'POST /v1/chat/completions', creditMultiplier = 0, callerKey = '', sessionKey = '') {
+function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source = 'POST /v1/chat/completions', creditMultiplier = 0, callerKey = '', sessionKey = '', requestBody = {}) {
   return {
     status: 200,
     stream: true,
@@ -638,8 +639,9 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       const reuseEnabled = useCascade && isExperimentalEnabled('cascadeConversationReuse');
       const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
       const lastUserHash = reuseEnabled ? latestUserHash(messages, modelKey, callerKey) : '';
-      const shapeHash = reuseEnabled ? requestShapeHash({ model, stream: true, tools: emulateTools ? true : undefined }, modelKey, callerKey) : '';
-      let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey, { lastUserHash, requestShapeHash: shapeHash }) : null;
+      const shapeHash = reuseEnabled ? requestShapeHash(requestBody, modelKey, callerKey) : '';
+      const allowSessionFallback = reuseEnabled && isExperimentalEnabled('cascadeSessionFallbackReuse');
+      let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey, { lastUserHash, requestShapeHash: shapeHash, allowSessionFallback }) : null;
       if (reuseEntry) log.info(`Chat: cascade reuse HIT reason=${reuseEntry.reuseReason || 'unknown'} cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
 
       // Always strip <tool_call>/<tool_result> blocks in Cascade mode.

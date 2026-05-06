@@ -17,9 +17,10 @@ const MAX_ENTRIES = 500;
 const _store = new Map();
 const _stats = { hits: 0, misses: 0, stores: 0, evictions: 0 };
 
-function normalize(body) {
+function normalize(body, namespace = '') {
   // Only the semantically meaningful fields — ignore stream flag, user id, etc.
   return {
+    namespace,
     model: body.model || '',
     messages: body.messages || [],
     tools: body.tools || null,
@@ -30,8 +31,8 @@ function normalize(body) {
   };
 }
 
-export function cacheKey(body) {
-  const json = JSON.stringify(normalize(body));
+export function cacheKey(body, namespace = '') {
+  const json = JSON.stringify(normalize(body, namespace));
   return createHash('sha256').update(json).digest('hex');
 }
 

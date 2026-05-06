@@ -31,6 +31,7 @@ export const DEFAULT_IDENTITY_PROMPTS = {
 const DEFAULTS = {
   experimental: {
     cascadeConversationReuse: true,
+    cascadeSessionFallbackReuse: false,
     modelIdentityPrompt: true,
     preflightRateLimit: false,
   },

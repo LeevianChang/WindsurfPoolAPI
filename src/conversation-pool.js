@@ -34,8 +34,8 @@ const POOL_MAX = 500;
 // fingerprint -> { cascadeId, sessionId, lsPort, apiKey, lastUserHash, requestShapeHash, createdAt, lastAccess }
 const _pool = new Map();
 // sessionKey -> latest fingerprint. This mirrors sub2api's sticky-session
-// layer: exact fingerprint is safest, session fallback preserves continuity
-// when clients compact or slightly reshape prior turns.
+// layer, but session fallback is opt-in and restricted to explicit session
+// identifiers; content-derived fallback keys are too broad for cascade reuse.
 const _sessionIndex = new Map();
 
 const stats = { hits: 0, sessionHits: 0, misses: 0, stores: 0, evictions: 0, expired: 0 };
@@ -184,6 +184,18 @@ export function checkout(fingerprint, callerKey = '', sessionKey = '', opts = {}
   if (fingerprint) {
     const entry = _pool.get(fingerprint);
     if (validEntry(entry, callerKey)) {
+      const currentLastUserHash = opts?.lastUserHash || '';
+      if (currentLastUserHash && entry.lastUserHash && currentLastUserHash === entry.lastUserHash) {
+        deleteFingerprint(fingerprint);
+        stats.misses++;
+        return null;
+      }
+      const currentRequestShapeHash = opts?.requestShapeHash || '';
+      if (currentRequestShapeHash && entry.requestShapeHash && currentRequestShapeHash !== entry.requestShapeHash) {
+        deleteFingerprint(fingerprint);
+        stats.misses++;
+        return null;
+      }
       deleteFingerprint(fingerprint);
       stats.hits++;
       return { ...entry, reuseReason: 'fingerprint' };
@@ -194,17 +206,20 @@ export function checkout(fingerprint, callerKey = '', sessionKey = '', opts = {}
     }
   }
 
-  if (sessionKey) {
+  const allowSessionFallback = opts?.allowSessionFallback === true && String(sessionKey || '').startsWith('session:');
+  if (allowSessionFallback) {
     const sessionFp = _sessionIndex.get(sessionKey);
     const entry = sessionFp ? _pool.get(sessionFp) : null;
     if (validEntry(entry, callerKey)) {
       const currentLastUserHash = opts?.lastUserHash || '';
       if (currentLastUserHash && entry.lastUserHash && currentLastUserHash === entry.lastUserHash) {
+        deleteFingerprint(sessionFp);
         stats.misses++;
         return null;
       }
       const currentRequestShapeHash = opts?.requestShapeHash || '';
       if (currentRequestShapeHash && entry.requestShapeHash && currentRequestShapeHash !== entry.requestShapeHash) {
+        deleteFingerprint(sessionFp);
         stats.misses++;
         return null;
       }
