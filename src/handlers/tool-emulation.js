@@ -122,7 +122,13 @@ function resolveToolChoice(tc) {
   return { mode: 'auto', forceName: null };
 }
 
-export function buildToolPreambleForProto(tools, toolChoice) {
+function withCallerEnv(lines, callerEnv) {
+  if (!callerEnv) return lines;
+  lines.push('', 'Caller environment facts. Prefer these over any Cascade/Windsurf placeholder workspace assumptions:', callerEnv);
+  return lines;
+}
+
+export function buildToolPreambleForProto(tools, toolChoice, callerEnv = '') {
   if (!Array.isArray(tools) || tools.length === 0) return '';
   const { mode, forceName } = resolveToolChoice(toolChoice);
 
@@ -133,6 +139,7 @@ export function buildToolPreambleForProto(tools, toolChoice) {
   if (forceName) {
     lines.push(`7. You MUST call the function "${forceName}". No other function and no direct answer.`);
   }
+  withCallerEnv(lines, callerEnv);
   lines.push('');
   lines.push('Available functions:');
   for (const t of tools) {
@@ -151,8 +158,117 @@ export function buildToolPreambleForProto(tools, toolChoice) {
   return lines.join('\n');
 }
 
+function functionSpec(t) {
+  if (t?.type !== 'function' || !t.function) return null;
+  return t.function;
+}
+
+export function buildSchemaCompactToolPreambleForProto(tools, toolChoice, callerEnv = '') {
+  if (!Array.isArray(tools) || tools.length === 0) return '';
+  const { mode, forceName } = resolveToolChoice(toolChoice);
+  const lines = [TOOL_PROTOCOL_SYSTEM_HEADER, TOOL_CHOICE_SUFFIX[mode] || TOOL_CHOICE_SUFFIX.auto];
+  if (forceName) lines.push(`7. You MUST call the function "${forceName}". No other function and no direct answer.`);
+  withCallerEnv(lines, callerEnv);
+  lines.push('', 'Available functions as compact JSON:');
+  const compact = tools.map(functionSpec).filter(Boolean).map(fn => ({
+    name: fn.name || '',
+    description: fn.description || '',
+    parameters: fn.parameters || {},
+  }));
+  lines.push(JSON.stringify(compact));
+  return lines.join('\n');
+}
+
+export function buildSkinnyToolPreambleForProto(tools, toolChoice, callerEnv = '') {
+  if (!Array.isArray(tools) || tools.length === 0) return '';
+  const { mode, forceName } = resolveToolChoice(toolChoice);
+  const lines = [TOOL_PROTOCOL_SYSTEM_HEADER, TOOL_CHOICE_SUFFIX[mode] || TOOL_CHOICE_SUFFIX.auto];
+  if (forceName) lines.push(`7. You MUST call the function "${forceName}". No other function and no direct answer.`);
+  withCallerEnv(lines, callerEnv);
+  lines.push('', 'Available functions:');
+  for (const fn of tools.map(functionSpec).filter(Boolean)) {
+    const props = fn.parameters?.properties && typeof fn.parameters.properties === 'object'
+      ? Object.keys(fn.parameters.properties)
+      : [];
+    const required = Array.isArray(fn.parameters?.required) ? fn.parameters.required : [];
+    lines.push(`- ${fn.name || ''}: ${fn.description || ''}${props.length ? ` Args: ${props.join(', ')}.` : ''}${required.length ? ` Required: ${required.join(', ')}.` : ''}`);
+  }
+  return lines.join('\n');
+}
+
+export function buildCompactToolPreambleForProto(tools, toolChoice, callerEnv = '') {
+  if (!Array.isArray(tools) || tools.length === 0) return '';
+  const { mode, forceName } = resolveToolChoice(toolChoice);
+  const lines = [
+    'You can call functions by emitting exactly one-line JSON in <tool_call>{"name":"function","arguments":{}}</tool_call>. Stop after tool calls.',
+    TOOL_CHOICE_SUFFIX[mode] || TOOL_CHOICE_SUFFIX.auto,
+  ];
+  if (forceName) lines.push(`You MUST call only "${forceName}".`);
+  withCallerEnv(lines, callerEnv);
+  lines.push('Function names: ' + tools.map(functionSpec).filter(Boolean).map(fn => fn.name).filter(Boolean).join(', '));
+  return lines.join('\n');
+}
+
+export function applyToolPreambleBudget(tools, toolChoice, opts = {}) {
+  const softBytes = opts.softBytes ?? parseInt(process.env.TOOL_PREAMBLE_SOFT_BYTES || '24000', 10);
+  const hardBytes = opts.hardBytes ?? parseInt(process.env.TOOL_PREAMBLE_HARD_BYTES || '48000', 10);
+  const callerEnv = opts.callerEnv || '';
+  const tiers = [
+    ['full', buildToolPreambleForProto],
+    ['schema-compact', buildSchemaCompactToolPreambleForProto],
+    ['skinny', buildSkinnyToolPreambleForProto],
+    ['names-only', buildCompactToolPreambleForProto],
+  ];
+  let chosen = { tier: 'empty', preamble: '', bytes: 0, compacted: false, softBytes, hardBytes, ok: true };
+  for (const [tier, build] of tiers) {
+    const preamble = build(tools || [], toolChoice, callerEnv);
+    const bytes = Buffer.byteLength(preamble, 'utf8');
+    chosen = { tier, preamble, bytes, compacted: tier !== 'full', softBytes, hardBytes, ok: bytes <= hardBytes };
+    if (bytes <= softBytes) break;
+  }
+  return chosen;
+}
+
 function safeParseJson(s) {
   try { return JSON.parse(s); } catch { return null; }
+}
+
+function escapeAttr(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function sanitizeToolResultContent(content, maxBytes = parseInt(process.env.TOOL_RESULT_MAX_BYTES || '64000', 10)) {
+  let text = typeof content === 'string' ? content : JSON.stringify(content ?? '');
+  text = text.replace(/<\/?tool_call>/gi, '[tool_call tag removed]')
+    .replace(/<\/?tool_result\b[^>]*>/gi, '[tool_result tag removed]')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+  const bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes <= maxBytes) return text;
+  let kept = text;
+  while (Buffer.byteLength(kept, 'utf8') > maxBytes && kept.length > 0) {
+    kept = kept.slice(0, Math.floor(kept.length * 0.9));
+  }
+  return kept + `\n\n[tool_result truncated: ${bytes} bytes > ${maxBytes} bytes]`;
+}
+
+export function validateToolResultChain(messages) {
+  if (!Array.isArray(messages)) return { ok: true };
+  const pending = new Set();
+  for (const m of messages) {
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (tc?.id) pending.add(String(tc.id));
+      }
+      continue;
+    }
+    if (m?.role === 'tool') {
+      const id = String(m.tool_call_id || '');
+      if (!id) return { ok: false, message: 'tool message missing tool_call_id' };
+      if (!pending.has(id)) return { ok: false, message: `tool_result without matching assistant tool_call id: ${id}` };
+      pending.delete(id);
+    }
+  }
+  return { ok: true };
 }
 
 /**
@@ -171,12 +287,10 @@ export function normalizeMessagesForCascade(messages, tools) {
 
     if (m.role === 'tool') {
       const id = m.tool_call_id || 'unknown';
-      const content = typeof m.content === 'string'
-        ? m.content
-        : JSON.stringify(m.content ?? '');
+      const content = sanitizeToolResultContent(m.content);
       out.push({
         role: 'user',
-        content: `<tool_result tool_call_id="${id}">\n${content}\n</tool_result>`,
+        content: `<tool_result tool_call_id="${escapeAttr(id)}">\n${content}\n</tool_result>`,
       });
       continue;
     }

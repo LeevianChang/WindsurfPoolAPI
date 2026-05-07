@@ -6,11 +6,10 @@
  * Windsurf backend keep its own per-cascade context cached — we avoid
  * resending the full history on each turn and the server responds faster.
  *
- * The key is a "fingerprint" of the conversation up to (but not including)
- * the newest user message. A client sending [u1, a1, u2] looks up fp([u1, a1]);
- * a hit means we already drove the cascade to exactly that state. We then
- * `SendUserCascadeMessage(u2)` on the stored cascade_id and, on success,
- * re-store the entry under fp([u1, a1, u2, a2]) for the next turn.
+ * The key is a semantic fingerprint of the caller-visible trajectory up to
+ * (but not including) the newest user/tool turn. It includes assistant text,
+ * assistant tool calls, normalized system prompt, and model/caller scope so
+ * we resume only when the upstream cascade should already be at that state.
  *
  * Safety rails:
  *   - Entries are pinned to a specific (apiKey, lsPort) pair. We must reuse
@@ -31,7 +30,9 @@ function positiveIntEnv(name, fallback) {
 const POOL_TTL_MS = positiveIntEnv('CASCADE_POOL_TTL_MS', 30 * 60 * 1000);
 const POOL_MAX = 500;
 
-// fingerprint -> { cascadeId, sessionId, lsPort, apiKey, lastUserHash, requestShapeHash, createdAt, lastAccess }
+const KEY_VERSION = 2;
+
+// fingerprint -> { cascadeId, sessionId, lsPort, apiKey, stepOffset, generatorOffset, lastUserHash, requestShapeHash, createdAt, lastAccess }
 const _pool = new Map();
 // sessionKey -> latest fingerprint. This mirrors sub2api's sticky-session
 // layer, but session fallback is opt-in and restricted to explicit session
@@ -42,6 +43,10 @@ const stats = { hits: 0, sessionHits: 0, misses: 0, stores: 0, evictions: 0, exp
 
 function sha256(s) {
   return createHash('sha256').update(s).digest('hex');
+}
+
+function shortDigest(s, n = 32) {
+  return sha256(String(s ?? '')).slice(0, n);
 }
 
 function messageContentString(message) {
@@ -79,13 +84,54 @@ function stripMetaTags(s) {
   return s.replace(META_TAG_RE, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-function canonicalise(messages) {
-  return messages.map(m => {
-    let raw;
-    if (typeof m.content === 'string') raw = m.content;
-    else if (Array.isArray(m.content)) raw = m.content.map(p => (typeof p?.text === 'string' ? p.text : JSON.stringify(p))).join('');
-    else raw = JSON.stringify(m.content ?? '');
-    return { role: m.role, content: stripMetaTags(raw) };
+function normalizeSystemPromptForHash(s) {
+  let out = String(s || '')
+    .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, '<ts>')
+    .replace(/\b(Today(?:'s)?\s+(?:date|is)(?:\s+is)?\s*[:\-]?\s*)\d{4}-\d{2}-\d{2}/gi, '$1<date>')
+    .replace(/(?<!\d)\d{4}-\d{2}-\d{2}(?!\d|T)/g, '<date>')
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<uuid>')
+    .replace(/(^[ \t]*[-*•]?\s*(?:Working\s+directory|Current\s+working\s+directory|cwd|CWD)\s*[:：])[^\n]*/gim, '$1 <cwd>')
+    .replace(/(^[ \t]*[-*•]?\s*(?:Current\s+(?:date|time)|Time)\s*[:：])[^\n]*/gim, '$1 <time>')
+    .replace(/(^[ \t]*[-*•]?\s*(?:Session\s*ID|sessionId|session_id)\s*[:：])[^\n]*/gim, '$1 <sessionid>')
+    .replace(/(?<![\d.])(?:1[7-9]|20)\d{8}(?:\d{3})?(?![\d.])/g, '<epoch>');
+
+  const nextHeading = '(?:Status|Recent commits|Recent files|gitStatus|Current branch|Main branch|Git user)\\s*:';
+  const blockEnd = `(?=^[ \\t]*${nextHeading}|^\\s*$|$(?![\\s\\S]))`;
+  out = out.replace(new RegExp(`^([ \\t]*Status\\s*:)[ \\t]*\\n[\\s\\S]*?${blockEnd}`, 'gim'), '$1\n<git-status>\n');
+  out = out.replace(new RegExp(`^([ \\t]*Recent commits\\s*:)[ \\t]*\\n[\\s\\S]*?${blockEnd}`, 'gim'), '$1\n<recent-commits>\n');
+  out = out.replace(new RegExp(`^([ \\t]*Recent files\\s*:)[ \\t]*\\n[\\s\\S]*?${blockEnd}`, 'gim'), '$1\n<recent-files>\n');
+  out = out.replace(/(?<![`'"\w])(?=[a-f0-9]*\d)(?=[a-f0-9]*[a-f])[a-f0-9]{7,12}(?![`'"\w])/gi, '<gitsha>');
+  return out;
+}
+
+function stableStringify(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(v).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(v[k])).join(',') + '}';
+}
+
+function canonicalContent(content, { system = false } = {}) {
+  const normalizeText = (text) => {
+    const stripped = stripMetaTags(String(text || ''));
+    return system ? normalizeSystemPromptForHash(stripped) : stripped;
+  };
+  if (typeof content === 'string') return [{ type: 'text', text: normalizeText(content) }];
+  if (!Array.isArray(content)) return [{ type: 'json', json: stableStringify(content ?? '') }];
+  return content.map(part => {
+    if (typeof part?.text === 'string') return { type: 'text', text: normalizeText(part.text) };
+    if (typeof part === 'string') return { type: 'text', text: normalizeText(part) };
+    const type = String(part?.type || '').toLowerCase();
+    const url = part?.image_url?.url || part?.url || part?.source?.url || '';
+    if (type === 'image' || type === 'image_url' || type === 'input_image') {
+      if (typeof url === 'string' && url.startsWith('data:')) {
+        const comma = url.indexOf(',');
+        return { type: 'image', hash: shortDigest(comma >= 0 ? url.slice(comma + 1) : url, 16) };
+      }
+      if (typeof part?.source?.data === 'string') return { type: 'image', hash: shortDigest(part.source.data, 16) };
+      return { type: 'image', url: String(url || part?.source?.file_id || '') };
+    }
+    return { type: type || 'unknown', json: stableStringify(part ?? '') };
   });
 }
 
@@ -93,35 +139,100 @@ function hasToolCalls(message) {
   return Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
 }
 
+function projectAssistantToolCalls(message) {
+  if (!hasToolCalls(message)) return [];
+  return message.tool_calls.map(tc => {
+    const name = tc?.function?.name || tc?.name || '';
+    const args = tc?.function?.arguments ?? tc?.arguments ?? tc?.input ?? '';
+    let canonicalArgs = args;
+    if (typeof args === 'string') {
+      try { canonicalArgs = stableStringify(JSON.parse(args)); } catch { canonicalArgs = args; }
+    } else {
+      canonicalArgs = stableStringify(args ?? null);
+    }
+    return { name, args: canonicalArgs };
+  });
+}
+
+function toolContextDigest(opts = {}) {
+  if (!opts.emulateTools) return '';
+  const tools = (Array.isArray(opts.tools) ? opts.tools.map(t => {
+    const fn = t?.function || t;
+    return {
+      name: fn?.name || '',
+      description: fn?.description || '',
+      parameters: fn?.parameters ?? fn?.input_schema ?? null,
+    };
+  }) : []).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  return shortDigest(stableStringify({
+    tools,
+    tool_choice: opts.toolChoice ?? null,
+    preambleHash: opts.toolPreamble ? shortDigest(opts.toolPreamble, 16) : '',
+    preambleTier: opts.preambleTier ?? null,
+  }));
+}
+
 /**
- * Fingerprint for "resume this conversation". Hash stable caller-visible turns
- * plus system instructions. Plain assistant text is excluded because clients
- * may restructure it between turns, but assistant tool_call turns are kept so
- * tool-result conversations resume the exact cascade that requested the tool.
+ * Fingerprint for "resume this conversation". Hash stable caller-visible
+ * turns plus system instructions. Assistant text is included so the stored
+ * post-turn key matches clients that send [u1, a1, u2] on the next request.
  */
-function stableTurns(messages) {
-  return messages
-    .filter(m => m.role === 'system' || m.role === 'user' || m.role === 'tool' || (m.role === 'assistant' && hasToolCalls(m)))
-    .map(m => {
-      if (m.role === 'tool') return { ...m, role: 'tool_result' };
-      if (m.role === 'assistant' && hasToolCalls(m)) {
-        return { role: 'assistant_tool_calls', content: JSON.stringify(m.tool_calls) };
-      }
-      return m;
-    });
+function projectMessage(message) {
+  const role = message?.role;
+  if (role === 'system') return { role: 'system', content: canonicalContent(message.content, { system: true }) };
+  if (role === 'user') return { role: 'user', content: canonicalContent(message.content) };
+  if (role === 'tool') {
+    return {
+      role: 'tool_result',
+      tool_call_id: typeof message?.tool_call_id === 'string' ? message.tool_call_id : '',
+      content: canonicalContent(message.content),
+    };
+  }
+  if (role === 'assistant') {
+    const blocks = canonicalContent(message.content);
+    const text = blocks
+      .filter(b => b.type === 'text')
+      .map(b => (b.text || '').replace(/\s+/g, ' ').trim())
+      .join('\n')
+      .trim();
+    return { role: 'assistant', text, tool_calls: projectAssistantToolCalls(message) };
+  }
+  return { role: String(role || 'unknown'), content: canonicalContent(message?.content) };
 }
 
-export function fingerprintBefore(messages, modelKey = '', callerKey = '') {
-  if (!Array.isArray(messages) || messages.length < 2) return null;
-  const turns = stableTurns(messages);
-  if (turns.length < 2) return null;
-  return sha256(String(callerKey || '') + '\0' + modelKey + '\0' + JSON.stringify(canonicalise(turns.slice(0, -1))));
+function priorTurnsForBefore(messages) {
+  if (!Array.isArray(messages)) return null;
+  let newest = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const role = messages[i]?.role;
+    if (role === 'user' || role === 'tool') { newest = i; break; }
+  }
+  if (newest <= 0) return null;
+  return messages.slice(0, newest);
 }
 
-export function fingerprintAfter(messages, modelKey = '', callerKey = '') {
-  const turns = stableTurns(messages);
-  if (!turns.length) return null;
-  return sha256(String(callerKey || '') + '\0' + modelKey + '\0' + JSON.stringify(canonicalise(turns)));
+function keyPayload(messages, modelKey, callerKey, scope, opts = {}) {
+  const turns = scope === 'after' ? messages : priorTurnsForBefore(messages);
+  if (!Array.isArray(turns) || !turns.length) return null;
+  return stableStringify({
+    v: KEY_VERSION,
+    caller: String(callerKey || ''),
+    model: String(modelKey || ''),
+    route: opts.route || 'chat',
+    tools: toolContextDigest(opts),
+    turns: turns.map(projectMessage),
+  });
+}
+
+export function fingerprintBefore(messages, modelKey = '', callerKey = '', opts = {}) {
+  const payload = keyPayload(messages, modelKey, callerKey, 'before', opts);
+  return payload ? sha256(payload) : null;
+}
+
+export function fingerprintAfter(messages, modelKey = '', callerKey = '', opts = {}) {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  const payload = keyPayload(messages, modelKey, callerKey, 'after', opts);
+  return payload ? sha256(payload) : null;
 }
 
 export function latestUserHash(messages, modelKey = '', callerKey = '') {
@@ -148,7 +259,7 @@ export function requestShapeHash(body = {}, modelKey = '', callerKey = '') {
 
 function prune(now) {
   for (const [fp, e] of _pool) {
-    if (now - e.lastAccess > POOL_TTL_MS) { deleteFingerprint(fp); stats.expired++; }
+    if (now - e.lastAccess > effectiveTtl(e)) { deleteFingerprint(fp); stats.expired++; }
   }
   if (_pool.size <= POOL_MAX) return;
   const entries = [..._pool.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess);
@@ -167,10 +278,15 @@ function deleteFingerprint(fingerprint) {
   }
 }
 
+function effectiveTtl(entry) {
+  const hint = Number(entry?.ttlHintMs);
+  return Number.isFinite(hint) && hint > 0 ? hint : POOL_TTL_MS;
+}
+
 function validEntry(entry, callerKey) {
   if (!entry) return false;
   if (entry.callerKey && callerKey && entry.callerKey !== callerKey) return false;
-  return Date.now() - entry.lastAccess <= POOL_TTL_MS;
+  return Date.now() - entry.lastAccess <= effectiveTtl(entry);
 }
 
 /**
@@ -201,7 +317,7 @@ export function checkout(fingerprint, callerKey = '', sessionKey = '', opts = {}
       return { ...entry, reuseReason: 'fingerprint' };
     }
     if (entry) {
-      if (Date.now() - entry.lastAccess > POOL_TTL_MS) stats.expired++;
+      if (Date.now() - entry.lastAccess > effectiveTtl(entry)) stats.expired++;
       deleteFingerprint(fingerprint);
     }
   }
@@ -228,7 +344,7 @@ export function checkout(fingerprint, callerKey = '', sessionKey = '', opts = {}
       return { ...entry, reuseReason: 'session' };
     }
     if (sessionFp) {
-      if (entry && Date.now() - entry.lastAccess > POOL_TTL_MS) stats.expired++;
+      if (entry && Date.now() - entry.lastAccess > effectiveTtl(entry)) stats.expired++;
       deleteFingerprint(sessionFp);
     }
   }
@@ -242,22 +358,32 @@ export function checkout(fingerprint, callerKey = '', sessionKey = '', opts = {}
  */
 export function checkin(fingerprint, entry, callerKey = '', sessionKey = '') {
   if (!fingerprint || !entry) return;
+  const fingerprints = Array.isArray(fingerprint)
+    ? fingerprint.filter(fp => typeof fp === 'string' && fp)
+    : [fingerprint];
+  if (!fingerprints.length) return;
   const now = Date.now();
-  _pool.set(fingerprint, {
-    cascadeId: entry.cascadeId,
-    sessionId: entry.sessionId,
-    lsPort: entry.lsPort,
-    apiKey: entry.apiKey,
-    lastUserHash: entry.lastUserHash || '',
-    requestShapeHash: entry.requestShapeHash || '',
-    callerKey: callerKey || entry.callerKey || '',
-    sessionKey: sessionKey || entry.sessionKey || '',
-    createdAt: entry.createdAt || now,
-    lastAccess: now,
-  });
+  for (const fp of fingerprints) {
+    _pool.set(fp, {
+      cascadeId: entry.cascadeId,
+      sessionId: entry.sessionId,
+      lsPort: entry.lsPort,
+      apiKey: entry.apiKey,
+      stepOffset: Number.isFinite(entry.stepOffset) ? entry.stepOffset : 0,
+      generatorOffset: Number.isFinite(entry.generatorOffset) ? entry.generatorOffset : 0,
+      lastUserHash: entry.lastUserHash || '',
+      requestShapeHash: entry.requestShapeHash || '',
+      callerKey: callerKey || entry.callerKey || '',
+      sessionKey: sessionKey || entry.sessionKey || '',
+      createdAt: entry.createdAt || now,
+      lastAccess: now,
+      ...(Number.isFinite(entry.ttlHintMs) && entry.ttlHintMs > 0 ? { ttlHintMs: entry.ttlHintMs } : {}),
+    });
+  }
   const key = sessionKey || entry.sessionKey || '';
-  if (key) _sessionIndex.set(key, fingerprint);
+  if (key) _sessionIndex.set(key, fingerprints[0]);
   stats.stores++;
+  if (fingerprints.length > 1) stats.aliasWrites = (stats.aliasWrites || 0) + fingerprints.length - 1;
   prune(now);
 }
 

@@ -526,17 +526,19 @@ export async function ensureLsForAccount(accountId) {
  * (legacy behaviour, used by generic 429 responses).
  */
 export function markRateLimited(apiKey, durationMs = 5 * 60 * 1000, modelKey = null) {
-  const account = accounts.find(a => a.apiKey === apiKey);
+  const account = accounts.find(a => a.apiKey === apiKey || a.id === apiKey);
   if (!account) return;
-  const until = Date.now() + durationMs;
+  const safeDuration = Math.min(24 * 60 * 60 * 1000, Math.max(1000, Number(durationMs) || 5 * 60 * 1000));
+  const until = Date.now() + safeDuration;
   if (modelKey) {
     if (!account._modelRateLimits) account._modelRateLimits = {};
-    account._modelRateLimits[modelKey] = until;
-    log.warn(`Account ${account.id} (${account.email}) rate-limited on ${modelKey} for ${Math.round(durationMs / 60000)} min`);
+    account._modelRateLimits[modelKey] = Math.max(account._modelRateLimits[modelKey] || 0, until);
+    log.warn(`Account ${account.id} (${account.email}) rate-limited on ${modelKey} for ${Math.ceil(safeDuration / 60000)} min`);
   } else {
-    account.rateLimitedUntil = until;
-    log.warn(`Account ${account.id} (${account.email}) rate-limited (all models) for ${Math.round(durationMs / 60000)} min`);
+    account.rateLimitedUntil = Math.max(account.rateLimitedUntil || 0, until);
+    log.warn(`Account ${account.id} (${account.email}) rate-limited (all models) for ${Math.ceil(safeDuration / 60000)} min`);
   }
+  notifyAccountSlotWaiters();
 }
 
 /**

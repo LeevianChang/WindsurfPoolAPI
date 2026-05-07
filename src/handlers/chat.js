@@ -20,12 +20,32 @@ import {
 } from '../conversation-pool.js';
 import {
   normalizeMessagesForCascade, ToolCallStreamParser, parseToolCallsFromText,
-  buildToolPreambleForProto,
+  applyToolPreambleBudget, validateToolResultChain,
 } from './tool-emulation.js';
 import { sanitizeText, PathSanitizeStream } from '../sanitize.js';
+import { mergeTranscriptMessages, replaceTranscript } from '../transcript-store.js';
 
 const HEARTBEAT_MS = 5_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
+const CASCADE_REUSE_STRICT = process.env.CASCADE_REUSE_STRICT === '1';
+const TOOL_EMULATED_STRICT_REUSE = process.env.TOOL_EMULATED_STRICT_REUSE !== '0';
+
+function shouldUseStrictCascadeReuse({ reuseEntry, emulateTools }) {
+  return !!reuseEntry && (CASCADE_REUSE_STRICT || (TOOL_EMULATED_STRICT_REUSE && emulateTools));
+}
+
+function strictReuseError(model, reason) {
+  return {
+    status: 409,
+    body: {
+      error: {
+        message: `${model} 上下文复用绑定资源暂不可用（${reason}）。为避免切换账号或语言服务器导致上下文丢失，请稍后重试。`,
+        type: 'cascade_reuse_unavailable',
+        retryable: true,
+      },
+    },
+  };
+}
 
 function classifyUpstreamError(err) {
   const message = err?.message || String(err || '');
@@ -53,10 +73,41 @@ function classifyUpstreamError(err) {
   return { action: 'return', status: err?.isModelError ? 403 : 502, type: err?.isModelError ? 'model_error' : 'upstream_error', tag: err?.isModelError ? 'model_error' : 'upstream_error' };
 }
 
+function parseRetryAfterMs(err) {
+  const headers = err?.headers || err?.response?.headers || {};
+  const rawHeader = headers['retry-after'] || headers['Retry-After'] || headers.get?.('retry-after');
+  if (rawHeader != null) {
+    const s = String(rawHeader).trim();
+    const seconds = Number(s);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(24 * 60 * 60 * 1000, Math.max(1000, seconds * 1000));
+    const dateMs = Date.parse(s);
+    if (Number.isFinite(dateMs)) return Math.min(24 * 60 * 60 * 1000, Math.max(1000, dateMs - Date.now()));
+  }
+  const msg = String(err?.message || err || '');
+  const patterns = [
+    [/retry(?: again)? after\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec(?:onds?)?|m|min(?:utes?)?|h|hours?)/i, 1, 2],
+    [/try again in\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec(?:onds?)?|m|min(?:utes?)?|h|hours?)/i, 1, 2],
+    [/wait\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec(?:onds?)?|m|min(?:utes?)?|h|hours?)/i, 1, 2],
+  ];
+  for (const [re, nIdx, uIdx] of patterns) {
+    const m = msg.match(re);
+    if (!m) continue;
+    const n = Number(m[nIdx]);
+    if (!Number.isFinite(n)) continue;
+    const unit = m[uIdx].toLowerCase();
+    const mult = unit.startsWith('ms') || unit.startsWith('millisecond') ? 1
+      : unit === 's' || unit.startsWith('sec') ? 1000
+      : unit === 'm' || unit.startsWith('min') ? 60 * 1000
+      : 60 * 60 * 1000;
+    return Math.min(24 * 60 * 60 * 1000, Math.max(1000, Math.ceil(n * mult)));
+  }
+  return 5 * 60 * 1000;
+}
+
 function applyErrorSideEffects(err, apiKey, modelKey) {
   const cls = classifyUpstreamError(err);
   if (cls.tag === 'auth_error') reportError(apiKey);
-  if (cls.tag === 'rate_limit') markRateLimited(apiKey, 5 * 60 * 1000, modelKey);
+  if (cls.tag === 'rate_limit') markRateLimited(apiKey, parseRetryAfterMs(err), modelKey);
   if (cls.tag === 'transient_error' && /internal error occurred.*error id/i.test(err?.message || '')) {
     reportInternalError(apiKey);
   }
@@ -113,6 +164,112 @@ function buildIdentitySystemMessage(displayModel, provider) {
 
 function genId() {
   return 'chatcmpl-' + randomUUID().replace(/-/g, '').slice(0, 29);
+}
+
+function appendAssistantTurn(messages, text, toolCalls) {
+  const assistant = { role: 'assistant', content: text || '' };
+  if (Array.isArray(toolCalls) && toolCalls.length) assistant.tool_calls = toolCalls;
+  return [...(Array.isArray(messages) ? messages : []), assistant];
+}
+
+function buildReuseOpts({ tools, toolChoice, toolPreamble, preambleTier, emulateTools, route = 'chat' } = {}) {
+  return {
+    tools: Array.isArray(tools) ? tools : [],
+    toolChoice: toolChoice ?? null,
+    toolPreamble: toolPreamble || '',
+    preambleTier: preambleTier || null,
+    emulateTools: !!emulateTools,
+    route,
+  };
+}
+
+function hasOneHourCacheControl(value) {
+  if (!value || typeof value !== 'object') return false;
+  const ttl = String(value.ttl || value.expires_after || value.expiresAfter || '').toLowerCase();
+  return ttl === '1h' || ttl === '60m' || ttl === '3600s' || ttl.includes('hour');
+}
+
+function requestTtlHintMs(body = {}) {
+  const visit = (value) => {
+    if (!value || typeof value !== 'object') return false;
+    if (hasOneHourCacheControl(value.cache_control || value.cacheControl)) return true;
+    if (Array.isArray(value)) return value.some(visit);
+    return Object.values(value).some(visit);
+  };
+  return visit(body) ? 90 * 60 * 1000 : undefined;
+}
+
+function latestUserText(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== 'user') continue;
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) return m.content.filter(p => typeof p?.text === 'string').map(p => p.text).join('\n');
+  }
+  return '';
+}
+
+function detectFabricatedToolResult(text, messages) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed || trimmed.length > 240) return null;
+  const askedForAction = /\b(?:run|exec|execute|cat|ls|grep|find|read|search|list|invoke|call|shell|bash|command|tool|function)\b/i.test(latestUserText(messages));
+  if (!askedForAction) return null;
+  const patterns = [
+    /^\d{10,13}$/,
+    /[A-Z][A-Z0-9_]{3,}_\d{10,}$/,
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/,
+    /^[a-f0-9]{32,64}$/i,
+    /^total \d+\s/im,
+    /^drwx[r-][w-][x-]/m,
+  ];
+  return patterns.some(re => re.test(trimmed))
+    ? { reason: 'fabricated_tool_result', sample: trimmed.slice(0, 120) }
+    : null;
+}
+
+function textFromContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.filter(p => typeof p?.text === 'string').map(p => p.text).join('\n');
+  return '';
+}
+
+function extractCallerEnvironment(messages) {
+  if (!Array.isArray(messages)) return '';
+  const seen = new Set();
+  const out = [];
+  const pathTail = String.raw`(?:[\/~]|[A-Za-z]:\\)[^\s\`'"<>\n.,;)]+`;
+  const patterns = [
+    ['cwd', new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s+)?(?:Primary\\s+|Current\\s+|Initial\\s+|Default\\s+|Active\\s+|Project\\s+)?(?:Working\\s+directory|cwd)\\s*[:=]\\s*\\`?(${pathTail})\\`?|<cwd>\\s*(${pathTail})\\s*</cwd>|current\\s+working\\s+directory(?:\\s+is)?\\s*[:=]?\\s*\\`?(${pathTail})\\`?`, 'gi'), v => `- Working directory: ${v}`],
+    ['git', /(?:^|\n)\s*(?:[-*]\s+)?Is(?:\s+(?:directory\s+)?(?:a\s+)?)git\s+repo(?:sitory)?\s*[:=]\s*([^\n<]+)/i, v => `- Is the directory a git repo: ${v.trim()}`],
+    ['platform', /(?:^|\n)\s*(?:[-*]\s+)?Platform\s*[:=]\s*([^\n<]+)/i, v => `- Platform: ${v.trim()}`],
+    ['os', /(?:^|\n)\s*(?:[-*]\s+)?OS\s+[Vv]ersion\s*[:=]\s*([^\n<]+)/i, v => `- OS version: ${v.trim()}`],
+  ];
+  for (const m of messages) {
+    const content = textFromContent(m?.content);
+    if (!content) continue;
+    for (const [key, re, fmt] of patterns) {
+      if (seen.has(key)) continue;
+      if (re.global) {
+        for (const match of content.matchAll(re)) {
+          const value = (match[1] || match[2] || match[3] || '').trim();
+          if (!value || /[\x00-\x1f]/.test(value) || value === '<workspace>') continue;
+          seen.add(key);
+          out.push(fmt(value));
+          break;
+        }
+      } else {
+        const match = content.match(re);
+        const value = (match?.[1] || '').trim();
+        if (!value || /[\x00-\x1f]/.test(value) || value === '<workspace>') continue;
+        seen.add(key);
+        out.push(fmt(value));
+      }
+    }
+    if (seen.size === patterns.length) break;
+  }
+  if (!seen.has('cwd')) return '';
+  return out.join('\n');
 }
 
 // Rough token estimate (~4 chars/token). Used only to populate the
@@ -197,14 +354,20 @@ export async function handleChatCompletions(body, deps = {}) {
     tools,
     tool_choice,
   } = body;
+  const callerKey = deps.callerKey || deps.context?.callerKey || '';
+  const sessionKey = deps.sessionKey || deps.context?.sessionKey || '';
+  const originalMessages = Array.isArray(messages) ? messages : [];
+  const effectiveMessages = mergeTranscriptMessages(sessionKey, originalMessages);
+  const transcriptRestored = effectiveMessages !== originalMessages;
+  if (transcriptRestored) {
+    log.info(`Transcript: restored ${effectiveMessages.length - originalMessages.length} prior message(s) for ${sessionKey.slice(0, 24)}…`);
+  }
 
   const modelKey = resolveModelWithOptions(reqModel || config.defaultModel, body);
   const modelInfo = getModelInfo(modelKey);
   const displayModel = modelInfo?.name || reqModel || config.defaultModel;
   const creditMultiplier = modelInfo?.credit || 0;
   const source = body._source || 'POST /v1/chat/completions';
-  const callerKey = deps.callerKey || deps.context?.callerKey || '';
-  const sessionKey = deps.sessionKey || deps.context?.sessionKey || '';
   const modelEnum = modelInfo?.enumValue || 0;
   const modelUid = modelInfo?.modelUid || null;
   // Models with a modelUid use the Cascade flow (StartCascade → SendUserCascadeMessage).
@@ -224,16 +387,31 @@ export async function handleChatCompletions(body, deps = {}) {
   // section directly so the model sees our emulated tool definitions as
   // authoritative system instructions.
   const hasTools = Array.isArray(tools) && tools.length > 0;
-  const hasToolHistory = Array.isArray(messages) && messages.some(m => m?.role === 'tool' || (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length));
+  const hasToolHistory = Array.isArray(effectiveMessages) && effectiveMessages.some(m => m?.role === 'tool' || (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length));
   const emulateTools = useCascade && (hasTools || hasToolHistory);
+  if (emulateTools) {
+    const chain = validateToolResultChain(effectiveMessages);
+    if (!chain.ok) return { status: 400, body: { error: { message: chain.message, type: 'invalid_tool_result' } } };
+  }
   // Build proto-level preamble (goes into tool_calling_section override);
   // pass empty tools to normalizeMessagesForCascade so it only rewrites
   // role:tool / assistant.tool_calls messages without injecting a user-level
   // preamble (that's now handled at the proto layer).
-  const toolPreamble = emulateTools ? buildToolPreambleForProto(tools || [], tool_choice) : '';
+  const callerEnv = extractCallerEnvironment(effectiveMessages);
+  const preambleBudget = emulateTools ? applyToolPreambleBudget(tools || [], tool_choice, { callerEnv }) : { preamble: '', tier: 'empty', ok: true };
+  if (!preambleBudget.ok) {
+    return {
+      status: 400,
+      body: { error: { message: `Tool schema is too large for Cascade tool emulation (${preambleBudget.bytes} bytes > ${preambleBudget.hardBytes} bytes)`, type: 'tool_schema_too_large' } },
+    };
+  }
+  if (emulateTools && preambleBudget.compacted) {
+    log.info(`Tool preamble compacted tier=${preambleBudget.tier} bytes=${preambleBudget.bytes}`);
+  }
+  const toolPreamble = preambleBudget.preamble;
   let cascadeMessages = emulateTools
-    ? normalizeMessagesForCascade(messages, [])
-    : [...messages];
+    ? normalizeMessagesForCascade(effectiveMessages, [])
+    : [...effectiveMessages];
 
   // ── Model identity prompt injection ──
   // When enabled, prepend a system message so the model identifies itself as
@@ -280,10 +458,10 @@ export async function handleChatCompletions(body, deps = {}) {
 
   const chatId = genId();
   const created = Math.floor(Date.now() / 1000);
-  const ckey = emulateTools ? null : cacheKey(body, callerKey);
+  const ckey = emulateTools || transcriptRestored ? null : cacheKey(body, callerKey);
 
   if (stream) {
-    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, languageHint, source, creditMultiplier, callerKey, sessionKey, body);
+    return streamResponse(chatId, created, displayModel, modelKey, effectiveMessages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, languageHint, source, creditMultiplier, callerKey, sessionKey, body, tools, tool_choice, preambleBudget.tier);
   }
 
   // ── Local response cache (exact body match) ─────────────
@@ -301,7 +479,7 @@ export async function handleChatCompletions(body, deps = {}) {
       body: {
         id: chatId, object: 'chat.completion', created, model: displayModel,
         choices: [{ index: 0, message, finish_reason: 'stop' }],
-        usage: cachedUsage(messages, cached.text),
+        usage: cachedUsage(effectiveMessages, cached.text),
       },
     };
   }
@@ -316,9 +494,11 @@ export async function handleChatCompletions(body, deps = {}) {
   // turns so tool-result conversations can keep the cascade that requested the
   // tool instead of replaying the whole transcript every turn.
   const reuseEnabled = useCascade && isExperimentalEnabled('cascadeConversationReuse');
-  const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
-  const lastUserHash = reuseEnabled ? latestUserHash(messages, modelKey, callerKey) : '';
+  const reuseOpts = buildReuseOpts({ tools, toolChoice: tool_choice, toolPreamble, preambleTier: preambleBudget.tier, emulateTools, route: 'chat' });
+  const fpBefore = reuseEnabled ? fingerprintBefore(effectiveMessages, modelKey, callerKey, reuseOpts) : null;
+  const lastUserHash = reuseEnabled ? latestUserHash(effectiveMessages, modelKey, callerKey) : '';
   const shapeHash = reuseEnabled ? requestShapeHash(body, modelKey, callerKey) : '';
+  const ttlHintMs = reuseEnabled ? requestTtlHintMs(body) : undefined;
   const allowSessionFallback = reuseEnabled && isExperimentalEnabled('cascadeSessionFallbackReuse');
   let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey, { lastUserHash, requestShapeHash: shapeHash, allowSessionFallback }) : null;
   if (reuseEntry) log.info(`Chat: cascade reuse HIT reason=${reuseEntry.reuseReason || 'unknown'} cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… model=${displayModel}`);
@@ -335,6 +515,9 @@ export async function handleChatCompletions(body, deps = {}) {
       // First attempt pins to the account that owns the cached cascade.
       acct = acquireAccountByKey(reuseEntry.apiKey, modelKey);
       if (!acct) {
+        if (shouldUseStrictCascadeReuse({ reuseEntry, emulateTools })) {
+          return strictReuseError(displayModel, 'owning account unavailable');
+        }
         log.info('Chat: cascade reuse skipped — owning account not available, falling back to fresh cascade');
         reuseEntry = null;
       }
@@ -369,17 +552,20 @@ export async function handleChatCompletions(body, deps = {}) {
       // Cascade pins cascade_id to a specific LS port too; if the LS it was
       // born on has been replaced, the cascade_id is dead.
       if (reuseEntry && reuseEntry.lsPort !== ls.port) {
+        if (shouldUseStrictCascadeReuse({ reuseEntry, emulateTools })) {
+          return strictReuseError(displayModel, 'language server changed');
+        }
         log.info('Chat: cascade reuse skipped — LS port changed');
         reuseEntry = null;
       }
       log.info(`Chat: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} account=${acct.email} ls=${ls.port}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
       const client = new WindsurfClient(acct.apiKey, ls.port, ls.csrfToken);
       const result = await nonStreamResponse(
-        client, chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid,
+        client, chatId, created, displayModel, modelKey, effectiveMessages, cascadeMessages, modelEnum, modelUid,
         useCascade, acct.apiKey, ckey,
-        reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, sessionKey, requestShapeHash: shapeHash } : null,
+        reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, sessionKey, requestShapeHash: shapeHash, reuseOpts, ttlHintMs } : null,
         emulateTools, toolPreamble, languageHint,
-        source, creditMultiplier,
+        source, creditMultiplier, sessionKey,
       );
       if (result.status === 200) return result;
       reuseEntry = null; // don't try to reuse on the retry
@@ -407,7 +593,7 @@ export async function handleChatCompletions(body, deps = {}) {
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, languageHint, source = 'POST /v1/chat/completions', creditMultiplier = 0) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, languageHint, source = 'POST /v1/chat/completions', creditMultiplier = 0, transcriptSessionKey = '') {
   const startTime = Date.now();
   try {
     let allText = '';
@@ -425,7 +611,13 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         if (c.text) allText += c.text;
         if (c.thinking) allThinking += c.thinking;
       }
-      cascadeMeta = { cascadeId: chunks.cascadeId, sessionId: chunks.sessionId, endReason: chunks.endReason };
+      cascadeMeta = {
+        cascadeId: chunks.cascadeId,
+        sessionId: chunks.sessionId,
+        endReason: chunks.endReason,
+        stepOffset: chunks.stepOffset,
+        generatorOffset: chunks.generatorOffset,
+      };
       serverUsage = chunks.usage || null;
       // Always strip <tool_call>/<tool_result> blocks from Cascade text.
       // - emulateTools=true: parsed tool_calls become OpenAI-format tool_calls.
@@ -436,6 +628,15 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         const parsed = parseToolCallsFromText(allText);
         allText = parsed.text;
         if (emulateTools) toolCalls = parsed.toolCalls;
+      }
+      if (emulateTools && !toolCalls.length) {
+        const fabricated = detectFabricatedToolResult(allText, messages);
+        if (fabricated) {
+          return {
+            status: 502,
+            body: { error: { message: `Model returned text that looks like fabricated tool output instead of emitting a tool_call: ${fabricated.sample}`, type: fabricated.reason } },
+          };
+        }
       }
       // Built-in Cascade tool calls (chunks.toolCalls — edit_file, view_file,
       // list_directory, run_command, etc.) are intentionally DROPPED. Their
@@ -475,19 +676,24 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     if (poolCtx && cascadeMeta?.cascadeId && cascadeMeta.endReason && cascadeMeta.endReason !== 'idle_done') {
       log.info(`Chat: cascade pool checkin skipped reason=${cascadeMeta.endReason} cascadeId=${cascadeMeta.cascadeId.slice(0, 8)}…`);
     }
+    if (allText || responseToolCalls.length) {
+      const poolMessages = appendAssistantTurn(messages, allText, responseToolCalls);
+      replaceTranscript(transcriptSessionKey, poolMessages);
+    }
     if (poolCtx && cascadeMeta?.cascadeId && cascadeMeta.endReason === 'idle_done' && (allText || responseToolCalls.length)) {
-      const poolMessages = responseToolCalls.length
-        ? [...messages, { role: 'assistant', content: null, tool_calls: responseToolCalls }]
-        : messages;
-      const fpAfter = fingerprintAfter(poolMessages, modelKey, poolCtx.callerKey || '');
+      const poolMessages = appendAssistantTurn(messages, allText, responseToolCalls);
+      const fpAfter = fingerprintAfter(poolMessages, modelKey, poolCtx.callerKey || '', poolCtx.reuseOpts || {});
       poolCheckin(fpAfter, {
         cascadeId: cascadeMeta.cascadeId,
         sessionId: cascadeMeta.sessionId,
         lsPort: poolCtx.lsPort,
         apiKey: poolCtx.apiKey,
+        stepOffset: cascadeMeta.stepOffset,
+        generatorOffset: cascadeMeta.generatorOffset,
         lastUserHash: latestUserHash(messages, modelKey, poolCtx.callerKey || ''),
         requestShapeHash: poolCtx.requestShapeHash || '',
         createdAt: poolCtx.reuseEntry?.createdAt,
+        ttlHintMs: poolCtx.ttlHintMs,
       }, poolCtx.callerKey || '', poolCtx.sessionKey || '');
     }
 
@@ -562,7 +768,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
   }
 }
 
-function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, languageHint, source = 'POST /v1/chat/completions', creditMultiplier = 0, callerKey = '', sessionKey = '', requestBody = {}) {
+function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, languageHint, source = 'POST /v1/chat/completions', creditMultiplier = 0, callerKey = '', sessionKey = '', requestBody = {}, tools = [], toolChoice = null, preambleTier = null) {
   return {
     status: 200,
     stream: true,
@@ -643,9 +849,11 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       // turns are canonicalised by the fingerprint so tool-result follow-ups
       // can resume the same cascade instead of replaying the whole transcript.
       const reuseEnabled = useCascade && isExperimentalEnabled('cascadeConversationReuse');
-      const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
+      const reuseOpts = buildReuseOpts({ tools, toolChoice, toolPreamble, preambleTier, emulateTools, route: 'chat' });
+      const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey, reuseOpts) : null;
       const lastUserHash = reuseEnabled ? latestUserHash(messages, modelKey, callerKey) : '';
       const shapeHash = reuseEnabled ? requestShapeHash(requestBody, modelKey, callerKey) : '';
+      const ttlHintMs = reuseEnabled ? requestTtlHintMs(requestBody) : undefined;
       const allowSessionFallback = reuseEnabled && isExperimentalEnabled('cascadeSessionFallbackReuse');
       let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey, sessionKey, { lastUserHash, requestShapeHash: shapeHash, allowSessionFallback }) : null;
       if (reuseEntry) log.info(`Chat: cascade reuse HIT reason=${reuseEntry.reuseReason || 'unknown'} cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
@@ -731,6 +939,11 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           if (reuseEntry && attempt === 0) {
             acct = acquireAccountByKey(reuseEntry.apiKey, modelKey);
             if (!acct) {
+              if (shouldUseStrictCascadeReuse({ reuseEntry, emulateTools })) {
+                lastErr = new Error(`${model} 上下文复用绑定资源暂不可用（owning account unavailable）。为避免切换账号导致上下文丢失，请稍后重试。`);
+                lastErr.type = 'cascade_reuse_unavailable';
+                break;
+              }
               log.info('Chat: cascade reuse skipped — owning account not available');
               reuseEntry = null;
             }
@@ -762,6 +975,11 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             const ls = getLsFor(acct.proxy);
             if (!ls) { lastErr = new Error('No LS instance available'); break; }
             if (reuseEntry && reuseEntry.lsPort !== ls.port) {
+              if (shouldUseStrictCascadeReuse({ reuseEntry, emulateTools })) {
+                lastErr = new Error(`${model} 上下文复用绑定资源暂不可用（language server changed）。为避免切换语言服务器导致上下文丢失，请稍后重试。`);
+                lastErr.type = 'cascade_reuse_unavailable';
+                break;
+              }
               log.info('Chat: cascade reuse skipped — LS port changed');
               reuseEntry = null;
             }
@@ -795,6 +1013,10 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             }
             emitContent(pathStreamText.flush());
             emitThinking(pathStreamThinking.flush());
+            if (emulateTools && !collectedToolCalls.length) {
+              const fabricated = detectFabricatedToolResult(accText, messages);
+              if (fabricated) throw new Error(`fabricated_tool_result: ${fabricated.sample}`);
+            }
             // Pool check-in on success (cascade only)
             if (reuseEnabled && cascadeResult?.cascadeId && cascadeResult.endReason && cascadeResult.endReason !== 'idle_done') {
               log.info(`Chat: cascade pool checkin skipped reason=${cascadeResult.endReason} cascadeId=${cascadeResult.cascadeId.slice(0, 8)}…`);
@@ -808,18 +1030,20 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
                   arguments: sanitizeText(tc.argumentsJson || '{}'),
                 },
               }));
-              const poolMessages = responseToolCalls.length
-                ? [...messages, { role: 'assistant', content: null, tool_calls: responseToolCalls }]
-                : messages;
-              const fpAfter = fingerprintAfter(poolMessages, modelKey, callerKey);
+              const poolMessages = appendAssistantTurn(messages, accText, responseToolCalls);
+              replaceTranscript(sessionKey, poolMessages);
+              const fpAfter = fingerprintAfter(poolMessages, modelKey, callerKey, reuseOpts);
               poolCheckin(fpAfter, {
                 cascadeId: cascadeResult.cascadeId,
                 sessionId: cascadeResult.sessionId,
                 lsPort: ls.port,
                 apiKey: currentApiKey,
+                stepOffset: cascadeResult.stepOffset,
+                generatorOffset: cascadeResult.generatorOffset,
                 lastUserHash,
                 requestShapeHash: shapeHash,
                 createdAt: reuseEntry?.createdAt,
+                ttlHintMs,
               }, callerKey, sessionKey);
             }
             // success

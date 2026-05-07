@@ -559,7 +559,7 @@ export function parseGeneratorMetadata(buf) {
     }
   }
   if (!found) return null;
-  return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+  return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, entryCount: metaEntries.length };
 }
 
 // ─── Cascade response parsers ──────────────────────────────

@@ -248,13 +248,20 @@ export class WindsurfClient {
 
     // "panel state not found" means the LS forgot the panel for our sessionId
     // (LS restarted, TTL expired, etc.). Re-run warmupCascade with a fresh
-    // sessionId and retry the handshake once.
+    // sessionId and retry the handshake.
     const isPanelMissing = (e) => /panel state not found|not_found.*panel/i.test(e?.message || '');
+    const isExpiredCascade = (e) => /not_found.*(cascade|trajectory)|(?:cascade|trajectory).*not[ _-]?found|expired.*cascade|unknown.*cascade/i.test(e?.message || '');
+    const isUntrustedWorkspace = (e) => /untrusted workspace|workspace.*not.*trusted/i.test(e?.message || '');
 
     try {
       // Step 1: Start cascade — with retry on panel-state-not-found
       let cascadeId;
-      let stepOffset = 0;
+      let stepOffset = Number.isInteger(reuseEntry?.stepOffset) && reuseEntry.stepOffset >= 0
+        ? reuseEntry.stepOffset
+        : 0;
+      let generatorOffset = Number.isInteger(reuseEntry?.generatorOffset) && reuseEntry.generatorOffset >= 0
+        ? reuseEntry.generatorOffset
+        : 0;
       const startFreshCascade = async () => {
         const startProto = buildStartCascadeRequest(this.apiKey, sessionId);
         const startResp = await grpcUnary(
@@ -307,18 +314,30 @@ export class WindsurfClient {
       if (sysText) sysText = neutralizeIdentityForCascade(sysText);
 
       let isResume = !!reuseEntry?.cascadeId;
-      if (isResume) {
+      if (isResume && (!Number.isInteger(reuseEntry?.stepOffset) || !Number.isInteger(reuseEntry?.generatorOffset))) {
         try {
-          const priorStepsProto = buildGetTrajectoryStepsRequest(cascadeId, 0);
-          const priorStepsResp = await grpcUnary(
-            this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(priorStepsProto)
-          );
-          stepOffset = parseTrajectorySteps(priorStepsResp).length;
+          if (!Number.isInteger(reuseEntry?.stepOffset)) {
+            const priorStepsProto = buildGetTrajectoryStepsRequest(cascadeId, 0);
+            const priorStepsResp = await grpcUnary(
+              this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(priorStepsProto)
+            );
+            stepOffset = parseTrajectorySteps(priorStepsResp).length;
+          }
+          if (!Number.isInteger(reuseEntry?.generatorOffset)) {
+            const metaReq = buildGetGeneratorMetadataRequest(cascadeId, 0);
+            const metaResp = await grpcUnary(
+              this.port, this.csrfToken,
+              `${LS_SERVICE}/GetCascadeTrajectoryGeneratorMetadata`,
+              grpcFrame(metaReq), 5000
+            );
+            generatorOffset = parseGeneratorMetadata(metaResp)?.entryCount || 0;
+          }
         } catch (e) {
           log.warn(`Cascade resume baseline failed, starting fresh: ${e.message}`);
           reuseEntry.cascadeId = null;
           isResume = false;
           stepOffset = 0;
+          generatorOffset = 0;
           cascadeId = await startFreshCascade();
         }
       }
@@ -353,51 +372,74 @@ export class WindsurfClient {
       if (languageHint?.text) text += `\n\n${languageHint.text}`;
       if (images.length) log.info(`Cascade: attaching ${images.length} image(s) to field 6`);
 
-      // Step 2: Send message (retry once on panel-state-not-found)
+      const rebuildFullHistoryText = async () => {
+        if (!(isResume && convo.length > 1)) return;
+        const maxHistoryBytes = cascadeHistoryBudget(modelUid);
+        const lines = [];
+        let historyBytes = sysText ? sysText.length : 0;
+        for (let i = convo.length - 2; i >= 0; i--) {
+          const m = convo[i];
+          const tag = m.role === 'user' ? 'human' : 'assistant';
+          const line = `<${tag}>\n${contentToString(m.content)}\n</${tag}>`;
+          if (historyBytes + line.length > maxHistoryBytes && lines.length > 0) break;
+          lines.unshift(line);
+          historyBytes += line.length;
+        }
+        const latest = convo[convo.length - 1];
+        const extracted = await extractImages(latest?.content ?? '');
+        text = `The following is a multi-turn conversation. You MUST remember and use all information from prior turns.\n\n${lines.join('\n\n')}\n\n<human>\n${extracted.text}\n</human>`;
+        images = extracted.images;
+        if (sysText) text = sysText + '\n\n' + text;
+        if (languageHint?.text) text += `\n\n${languageHint.text}`;
+        log.info('Cascade: rebuilt full history after resume failure');
+      };
+
+      // Step 2: Send message with recovery for LS panel/cascade state loss.
       const sendMessage = async () => {
         const sendProto = buildSendCascadeMessageRequest(this.apiKey, cascadeId, text, modelEnum, modelUid, sessionId, { toolPreamble, images, languageHint });
         await grpcUnary(
           this.port, this.csrfToken, `${LS_SERVICE}/SendUserCascadeMessage`, grpcFrame(sendProto)
         );
       };
-      try {
-        await sendMessage();
-      } catch (e) {
-        if (!isPanelMissing(e)) throw e;
-        log.warn(`Panel state missing on Send, re-warming + restarting cascade port=${this.port}`);
-        // Cascade expired — fall back to fresh with FULL history.
-        // text was built as resume-only (last message). Rebuild it.
-        if (isResume && convo.length > 1) {
-          const maxHistoryBytes = cascadeHistoryBudget(modelUid);
-          const lines = [];
-          let historyBytes = 0;
-          for (let i = convo.length - 2; i >= 0; i--) {
-            const m = convo[i];
-            const tag = m.role === 'user' ? 'human' : 'assistant';
-            const line = `<${tag}>\n${contentToString(m.content)}\n</${tag}>`;
-            if (historyBytes + line.length > maxHistoryBytes && lines.length > 0) break;
-            lines.unshift(line);
-            historyBytes += line.length;
+      const MAX_PANEL_RETRIES = 3;
+      let panelRetry = 0;
+      let historyRebuilt = false;
+      let cascadeExpiredOnce = false;
+      while (true) {
+        try {
+          await sendMessage();
+          break;
+        } catch (e) {
+          const expired = isExpiredCascade(e);
+          const untrusted = isUntrustedWorkspace(e);
+          if (!isPanelMissing(e) && !expired && !untrusted) throw e;
+          panelRetry++;
+          if (expired) cascadeExpiredOnce = true;
+          if (panelRetry > MAX_PANEL_RETRIES) {
+            const err = new Error(`${expired ? 'cascade expired' : untrusted ? 'untrusted workspace' : 'panel state lost'} and could not be re-established after ${MAX_PANEL_RETRIES} retries`);
+            if (cascadeExpiredOnce) err.reuseEntryInvalid = true;
+            throw err;
           }
-          const latest = convo[convo.length - 1];
-          const extracted = await extractImages(latest?.content ?? '');
-          text = `The following is a multi-turn conversation. You MUST remember and use all information from prior turns.\n\n${lines.join('\n\n')}\n\n<human>\n${extracted.text}\n</human>`;
-          images = extracted.images;
-          if (sysText) text = sysText + '\n\n' + text;
-          if (languageHint?.text) text += `\n\n${languageHint.text}`;
-          log.info('Cascade: rebuilt full history after resume failure');
+          log.warn(`Cascade send recovery retry ${panelRetry}/${MAX_PANEL_RETRIES} port=${this.port}: ${e.message}`);
+          if (!historyRebuilt) {
+            await rebuildFullHistoryText();
+            historyRebuilt = true;
+          }
+          await this.warmupCascade(true).catch(() => {});
+          sessionId = getLsEntryByPort(this.port)?.sessionId || randomUUID();
+          const startProto = buildStartCascadeRequest(this.apiKey, sessionId);
+          const startResp = await grpcUnary(
+            this.port, this.csrfToken, `${LS_SERVICE}/StartCascade`, grpcFrame(startProto)
+          );
+          cascadeId = parseStartCascadeResponse(startResp);
+          if (!cascadeId) throw new Error('StartCascade returned empty cascade_id after re-warm');
+          reuseEntry = null;
+          isResume = false;
+          stepOffset = 0;
+          generatorOffset = 0;
         }
-        await this.warmupCascade(true).catch(() => {});
-        sessionId = getLsEntryByPort(this.port)?.sessionId || randomUUID();
-        const startProto = buildStartCascadeRequest(this.apiKey, sessionId);
-        const startResp = await grpcUnary(
-          this.port, this.csrfToken, `${LS_SERVICE}/StartCascade`, grpcFrame(startProto)
-        );
-        cascadeId = parseStartCascadeResponse(startResp);
-        if (!cascadeId) throw new Error('StartCascade returned empty cascade_id after re-warm');
-        stepOffset = 0;
-        await sendMessage();
       }
+      if (cascadeExpiredOnce) this._lastReuseInvalidated = true;
 
       // Step 3: Poll for response.
       // Track per-step text cursors instead of a single global `lastYielded`.
@@ -684,7 +726,7 @@ export class WindsurfClient {
       // itself is already formed.
       let serverUsage = null;
       try {
-        const metaReq = buildGetGeneratorMetadataRequest(cascadeId, stepOffset);
+        const metaReq = buildGetGeneratorMetadataRequest(cascadeId, generatorOffset);
         const metaResp = await grpcUnary(
           this.port, this.csrfToken,
           `${LS_SERVICE}/GetCascadeTrajectoryGeneratorMetadata`,
@@ -721,6 +763,8 @@ export class WindsurfClient {
       chunks.cascadeId = cascadeId;
       chunks.sessionId = sessionId;
       chunks.endReason = endReason;
+      chunks.stepOffset = stepOffset + lastStepCount;
+      chunks.generatorOffset = generatorOffset + (serverUsage?.entryCount || 0);
       chunks.toolCalls = toolCalls;
       chunks.usage = serverUsage;
       if (serverUsage) {
