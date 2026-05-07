@@ -240,7 +240,7 @@ function extractCallerEnvironment(messages) {
   const out = [];
   const pathTail = String.raw`(?:[\/~]|[A-Za-z]:\\)[^\s\`'"<>\n.,;)]+`;
   const patterns = [
-    ['cwd', new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s+)?(?:Primary\\s+|Current\\s+|Initial\\s+|Default\\s+|Active\\s+|Project\\s+)?(?:Working\\s+directory|cwd)\\s*[:=]\\s*\\`?(${pathTail})\\`?|<cwd>\\s*(${pathTail})\\s*</cwd>|current\\s+working\\s+directory(?:\\s+is)?\\s*[:=]?\\s*\\`?(${pathTail})\\`?`, 'gi'), v => `- Working directory: ${v}`],
+    ['cwd', new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s+)?(?:Primary\\s+|Current\\s+|Initial\\s+|Default\\s+|Active\\s+|Project\\s+)?(?:Working\\s+directory|cwd)\\s*[:=]\\s*\`?(${pathTail})\`?|<cwd>\\s*(${pathTail})\\s*</cwd>|current\\s+working\\s+directory(?:\\s+is)?\\s*[:=]?\\s*\`?(${pathTail})\`?`, 'gi'), v => `- Working directory: ${v}`],
     ['git', /(?:^|\n)\s*(?:[-*]\s+)?Is(?:\s+(?:directory\s+)?(?:a\s+)?)git\s+repo(?:sitory)?\s*[:=]\s*([^\n<]+)/i, v => `- Is the directory a git repo: ${v.trim()}`],
     ['platform', /(?:^|\n)\s*(?:[-*]\s+)?Platform\s*[:=]\s*([^\n<]+)/i, v => `- Platform: ${v.trim()}`],
     ['os', /(?:^|\n)\s*(?:[-*]\s+)?OS\s+[Vv]ersion\s*[:=]\s*([^\n<]+)/i, v => `- OS version: ${v.trim()}`],
